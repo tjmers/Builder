@@ -1,0 +1,4 @@
+# Do not commit my builds or testing
+
+target/
+testing/
