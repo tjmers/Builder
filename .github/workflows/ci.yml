@@ -1,0 +1,65 @@
+name: "Testing for supported architectures"
+
+on:
+  push:
+    branch
+
+env:
+  CARGO_TERM_COLOR: always
+
+
+jobs:
+  test-linux:
+
+    name: ${{ matrix.distro }} (64-bit) test
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - distro: ubuntu
+            container: "ubuntu:24.04"
+          - distro: debian
+            container: "debian:bookworm-slim"
+          - distro: fedora
+            container: "fedora:40"
+
+    container:
+      image: ${{ matrix.container }}
+
+    steps:
+      # Step 1a
+      - name: Install System Dependencies (Ubuntu/Debian)
+        if: matrix.distro == 'ubuntu' || matrix.distro == 'debian'
+        run: |
+          apt-get update
+          apt-get install -y git curl build-essential libssl-dev pkg-config
+
+      # Step 1b
+      - name: Install System Dependencies (Fedora)
+        if: matrix.distro == 'fedora'
+        run: |
+          dnf check-update || true
+          dnf groupinstall -y "Development Tools"
+          dnf install -y git curl openssl-devel pkg-config
+
+      # Step 2: Bring the repository code into the container
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 3: Install the official Rust toolchain via rustup
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Step 4: Cache dependencies so you don't rebuild them from scratch every run
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.distro }}
+
+      # Step 5: Execute your test cases
+      - name: Run Cargo Tests
+        run: cargo test --workspace --all-targets
