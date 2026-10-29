@@ -4,7 +4,7 @@
 use builder::http_request::{HttpRequest, Method};
 use builder::http_response::{HttpResponse, Status};
 use builder::ip_address::IpAddress;
-use builder::server::Server;
+use builder::server::{RequestHandler, Server};
 
 fn addr() -> IpAddress {
     IpAddress::from([127, 0, 0, 1])
@@ -12,32 +12,32 @@ fn addr() -> IpAddress {
 
 // Every handler's body names the route it serves so tests can tell which one ran
 fn test_server() -> Server {
-    let mut s = Server::new();
-    s.add_endpoint(Method::Get, "/", |_request: &HttpRequest| -> HttpResponse {
+    let mut s = Server::new(());
+    s.add_endpoint(Method::Get, "/", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, "root")
     });
-    s.add_endpoint(Method::Get, "/about", |_request: &HttpRequest| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/about", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, "about")
     });
-    for (method, name) in [
-        (Method::Get, "GET"),
-        (Method::Post, "POST"),
-        (Method::Put, "PUT"),
-        (Method::Patch, "PATCH"),
-        (Method::Delete, "DELETE"),
-    ] {
-        s.add_endpoint(method, "/multi", move |_request: &HttpRequest| -> HttpResponse {
-            HttpResponse::new(Status::Ok, name)
-        });
+    // Handlers are fn pointers and cannot capture, so each method gets its own closure
+    let multi: [(Method, RequestHandler<()>); 5] = [
+        (Method::Get, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "GET")),
+        (Method::Post, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "POST")),
+        (Method::Put, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PUT")),
+        (Method::Patch, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PATCH")),
+        (Method::Delete, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "DELETE")),
+    ];
+    for (method, handler) in multi {
+        s.add_endpoint(method, "/multi", handler);
     }
     // Leaves /a and /a/b as intermediate nodes without handlers
-    s.add_endpoint(Method::Get, "/a/b/c", |_request: &HttpRequest| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/a/b/c", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, "abc")
     });
-    s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest| -> HttpResponse {
+    s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, request.content())
     });
-    s.add_endpoint(Method::Get, "/host", |request: &HttpRequest| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/host", |request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, request.header_value("host").unwrap_or("<missing>"))
     });
     s
@@ -112,14 +112,14 @@ fn nested_path_dispatches() {
 
 #[test]
 fn handler_status_passes_through() {
-    let mut s = Server::new();
-    s.add_endpoint(Method::Get, "/created", |_request: &HttpRequest| -> HttpResponse {
+    let mut s = Server::new(());
+    s.add_endpoint(Method::Get, "/created", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Created, "made")
     });
-    s.add_endpoint(Method::Get, "/error", |_request: &HttpRequest| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/error", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::InternalServerError, "oops")
     });
-    s.add_endpoint(Method::Get, "/empty", |_request: &HttpRequest| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/empty", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::NoContent, "")
     });
 
@@ -147,11 +147,11 @@ fn ipv6_address_is_handled_like_ipv4() {
 
 #[test]
 fn duplicate_endpoint_keeps_first_handler() {
-    let mut s = Server::new();
-    assert!(s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest| -> HttpResponse {
+    let mut s = Server::new(());
+    assert!(s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, "first")
     }));
-    assert!(!s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest| -> HttpResponse {
+    assert!(!s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, "second")
     }));
     assert_eq!(send(&s, &get("/dup")).body(), "first");
@@ -159,8 +159,8 @@ fn duplicate_endpoint_keeps_first_handler() {
 
 #[test]
 fn endpoint_registered_without_leading_slash() {
-    let mut s = Server::new();
-    s.add_endpoint(Method::Get, "about", |_request: &HttpRequest| -> HttpResponse {
+    let mut s = Server::new(());
+    s.add_endpoint(Method::Get, "about", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         HttpResponse::new(Status::Ok, "about")
     });
     let response = send(&s, &get("/about"));
@@ -449,7 +449,7 @@ fn intermediate_path_without_handler_is_not_found() {
 
 #[test]
 fn empty_server_root_is_not_found() {
-    assert_status(&Server::new(), &get("/"), Status::NotFound);
+    assert_status(&Server::new(()), &get("/"), Status::NotFound);
 }
 
 #[test]

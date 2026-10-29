@@ -5,15 +5,23 @@ use crate::http_response::{HttpResponse, Status};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
 
-pub type RequestHandler = Box<dyn fn(&HttpRequest<'_>) -> HttpResponse>;
+pub type RequestHandler<S> = fn(&HttpRequest<'_>, &S) -> HttpResponse;
 
 const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
 const VERSION_GREATEST: &str = "HTTP/1.1";
 
-#[derive(Default)]
-struct UriLookupTable {
-    handlers: [Option<RequestHandler>; Method::COUNT],
-    next: HashMap<String, UriLookupTable>,
+struct UriLookupTable<S> {
+    handlers: [Option<RequestHandler<S>>; Method::COUNT],
+    next: HashMap<String, UriLookupTable<S>>,
+}
+
+impl<S> Default for UriLookupTable<S> {
+    fn default() -> Self {
+        Self {
+            handlers: [None; Method::COUNT],
+            next: HashMap::new(),
+        }
+    }
 }
 
 // Finds the next '/' in s at or after from
@@ -27,21 +35,25 @@ fn any_valid_methods<T, const N: usize>
     arr.iter().any(|opt| opt.is_some())
 }
 
-#[derive(Default)]
-pub struct Server {
-    root_lookup: UriLookupTable,
+pub struct Server<S = ()> {
+    root_lookup: UriLookupTable<S>,
+    state: S,
 }
 
-impl Server {
-    pub fn new() -> Self {
-        Self::default()
+
+impl<S> Server<S> {
+    pub fn new(state: S) -> Self {
+        Self {
+            root_lookup: UriLookupTable::default(),
+            state,
+        }
     }
 
     pub fn add_endpoint(
         &mut self,
         method: Method,
         uri: &str,
-        callback: impl Fn(&HttpRequest<'_>) -> HttpResponse + 'static,
+        callback: RequestHandler<S>
     ) -> bool {
         if uri.is_empty() {
             log_error!("Cannot add an endpoint with an empty uri");
@@ -74,12 +86,16 @@ impl Server {
             return false;
         }
 
-        *handler = Some(Box::new(callback));
+        *handler = Some(callback);
 
         true
     }
 
-    pub fn invoke(&self, request: &HttpRequest<'_>, address: &IpAddress) -> HttpResponse {
+    pub fn invoke(
+        &self,
+        request: &HttpRequest<'_>,
+        _address: &IpAddress
+        ) -> HttpResponse {
         // Make sure that the request is valid
 
         if request.parsing_error() {
@@ -100,18 +116,18 @@ impl Server {
         // Forward the request to the path that will handle it
         // Traverse the path
         let path = request.path();
-        let mut state = &self.root_lookup;
+        let mut path_state = &self.root_lookup;
         let mut token_start = usize::from(path.starts_with('/'));
         let mut slash = next_slash(path, token_start);
 
         while let Some(s) = slash.filter(|&s| s != path.len() - 1) {
             let token = &path[token_start..s];
-            let Some(next_level) = state.next.get(token) else {
+            let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
                 return HttpResponse::new(Status::NotFound, "");
             };
-            state = next_level;
+            path_state = next_level;
 
             token_start = s + 1;
             slash = next_slash(path, token_start);
@@ -120,17 +136,17 @@ impl Server {
         // Process final
         if token_start < path.len() {
             let token = &path[token_start..];
-            let Some(next_level) = state.next.get(token) else {
+            let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
                 return HttpResponse::new(Status::NotFound, "");
             };
-            state = next_level;
+            path_state = next_level;
         }
 
         // Make sure that the method is actually implemented
-        let Some(handler) = &state.handlers[method as usize] else {
-            if any_valid_methods(&state.handlers) {
+        let Some(handler) = &path_state.handlers[method as usize] else {
+            if any_valid_methods(&path_state.handlers) {
                 log_error!("405 Method Not Allowed: {:?} {}", method, path);
                 return HttpResponse::new(Status::MethodNotAllowed, "");
             } else {
@@ -141,7 +157,7 @@ impl Server {
         };
 
         // Dispatch
-        let response = handler(request);
+        let response = handler(request, &self.state);
         log_info!("{:?} {} -> {}", method, path, response.status() as u16);
         response
     }
