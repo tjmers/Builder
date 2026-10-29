@@ -65,3 +65,28 @@ jobs:
       # Step 5: Execute your test cases
       - name: Run Cargo Tests
         run: cargo test --workspace --all-targets
+
+  test-windows:
+
+    name: windows (64-bit) test
+
+    runs-on: windows-latest
+
+    steps:
+      # Step 1: Bring the repository code onto the runner
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Install the official Rust toolchain via rustup (MSVC target)
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Step 3: Cache dependencies so you don't rebuild them from scratch every run
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      # Step 4: Execute your test cases
+      - name: Run Cargo Tests
+        run: cargo test --workspace --all-targets
