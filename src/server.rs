@@ -34,6 +34,17 @@ fn any_valid_methods<T, const N: usize>
     arr.iter().any(|opt| opt.is_some())
 }
 
+// Comma separated names of the methods with handlers, for the Allow header
+fn allowed_methods<S>(handlers: &[Option<RequestHandler<S>>; Method::COUNT]) -> String {
+    let has = |method: Method| handlers[method as usize].is_some();
+    Method::ALL
+        .into_iter()
+        .filter(|&method| has(method) || (method == Method::Head && has(Method::Get)))
+        .map(Method::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub struct Server<S = ()> {
     root_lookup: UriLookupTable<S>,
     state: S,
@@ -95,21 +106,21 @@ impl<S> Server<S> {
         request: &HttpRequest<'a>,
         _address: &IpAddress
         ) -> HttpResponse<'a> {
-        // Make sure that the request is valid
-
-        if request.parsing_error() {
-            log_error!("400 Bad Request: could not parse request for {}", request.path());
-            return HttpResponse::new(Status::BadRequest, "", "HTTP/1.1");
+        // The parser only accepts well formed versions, so anything else here is just unsupported
+        if !VERSIONS_SUPPORTED.contains(&request.version()) {
+            log_error!("505 HTTP Version Not Supported: {:?} for {}", request.version(), request.path());
+            return HttpResponse::new(Status::HttpVersionNotSupported, "", "HTTP/1.1");
         }
 
         let Some(method) = request.method() else {
-            log_error!("405 Method Not Allowed: unrecognized method for {}", request.path());
-            return HttpResponse::new(Status::MethodNotAllowed, "", "HTTP/1.1");
+            log_error!("501 Not Implemented: unrecognized method for {}", request.path());
+            return HttpResponse::new(Status::NotImplemented, "", request.version());
         };
 
-        if !VERSIONS_SUPPORTED.contains(&request.version()) {
-            log_error!("400 Bad Request: unsupported version {:?} for {}", request.version(), request.path());
-            return HttpResponse::new(Status::BadRequest, "", "HTTP/1.1");
+        // RFC 9112 6.1: only the chunked transfer coding is understood
+        if request.header_value("transfer-encoding").is_some_and(|coding| !coding.eq_ignore_ascii_case("chunked")) {
+            log_error!("501 Not Implemented: unsupported transfer coding for {}", request.path());
+            return HttpResponse::new(Status::NotImplemented, "", request.version());
         }
 
         // Forward the request to the path that will handle it
@@ -144,10 +155,16 @@ impl<S> Server<S> {
         }
 
         // Make sure that the method is actually implemented
-        let Some(handler) = &path_state.handlers[method as usize] else {
+        // RFC 9110 9.3.2: HEAD falls back to the GET handler, without the content
+        let handler = path_state.handlers[method as usize]
+            .or_else(|| path_state.handlers[Method::Get as usize].filter(|_| method == Method::Head));
+        let Some(handler) = handler else {
             if any_valid_methods(&path_state.handlers) {
                 log_error!("405 Method Not Allowed: {:?} {}", method, path);
-                return HttpResponse::new(Status::MethodNotAllowed, "", request.version());
+                // RFC 9110 15.5.6: a 405 must list the methods that are allowed
+                let mut response = HttpResponse::new(Status::MethodNotAllowed, "", request.version());
+                response.headers_mut().insert("Allow".to_owned(), allowed_methods(&path_state.handlers));
+                return response;
             } else {
                 // We return not found if we are at an intermediate path with no methods defined
                 log_error!("404 Not Found: {:?} {}", method, path);
@@ -156,7 +173,13 @@ impl<S> Server<S> {
         };
 
         // Dispatch
-        let response = handler(request, &self.state);
+        let mut response = handler(request, &self.state);
+        if method == Method::Head {
+            // Keep the Content-Length the GET would have sent
+            let length = response.body().len().to_string();
+            response.headers_mut().entry("Content-Length".to_owned()).or_insert(length);
+            response.body_mut().clear();
+        }
         log_info!("{:?} {} -> {}", method, path, response.status() as u16);
         response
     }
