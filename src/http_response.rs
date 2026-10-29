@@ -80,18 +80,20 @@ fn allows_body(status: Status) -> bool {
     code >= 200 && status != Status::NoContent && status != Status::NotModified
 }
 
-pub struct HttpResponse {
+pub struct HttpResponse<'a> {
     status: Status,
     headers: HashMap<String, String>,
     body: String,
+    version: &'a str,
 }
 
-impl HttpResponse {
-    pub fn new(status: Status, body: impl Into<String>) -> Self {
+impl<'a> HttpResponse<'a> {
+    pub fn new(status: Status, body: impl Into<String>, version: &'a str) -> Self {
         HttpResponse {
             status,
             headers: HashMap::new(),
             body: body.into(),
+            version,
         }
     }
 
@@ -122,7 +124,7 @@ impl HttpResponse {
         let has_body = allows_body(self.status);
 
         // Status line: VERSION SP CODE SP REASON
-        let mut response = format!("HTTP/1.1 {} {}\r\n", self.status as u16, reason_phrase(self.status));
+        let mut response = format!("{} {} {}\r\n", self.version, self.status as u16, reason_phrase(self.status));
 
         // Headers: KEY: VALUE
         let mut has_content_length = false;

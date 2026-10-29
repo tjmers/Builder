@@ -5,10 +5,9 @@ use crate::http_response::{HttpResponse, Status};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
 
-pub type RequestHandler<S> = fn(&HttpRequest<'_>, &S) -> HttpResponse;
+pub type RequestHandler<S> = for <'r, 'a> fn(&'r HttpRequest<'a>, &S) -> HttpResponse<'a>;
 
 const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
-const VERSION_GREATEST: &str = "HTTP/1.1";
 
 struct UriLookupTable<S> {
     handlers: [Option<RequestHandler<S>>; Method::COUNT],
@@ -91,26 +90,26 @@ impl<S> Server<S> {
         true
     }
 
-    pub fn invoke(
+    pub fn invoke<'a>(
         &self,
-        request: &HttpRequest<'_>,
+        request: &HttpRequest<'a>,
         _address: &IpAddress
-        ) -> HttpResponse {
+        ) -> HttpResponse<'a> {
         // Make sure that the request is valid
 
         if request.parsing_error() {
             log_error!("400 Bad Request: could not parse request for {}", request.path());
-            return HttpResponse::new(Status::BadRequest, "");
+            return HttpResponse::new(Status::BadRequest, "", "HTTP/1.1");
         }
 
         let Some(method) = request.method() else {
             log_error!("405 Method Not Allowed: unrecognized method for {}", request.path());
-            return HttpResponse::new(Status::MethodNotAllowed, "");
+            return HttpResponse::new(Status::MethodNotAllowed, "", "HTTP/1.1");
         };
 
         if !VERSIONS_SUPPORTED.contains(&request.version()) {
             log_error!("400 Bad Request: unsupported version {:?} for {}", request.version(), request.path());
-            return HttpResponse::new(Status::BadRequest, "");
+            return HttpResponse::new(Status::BadRequest, "", "HTTP/1.1");
         }
 
         // Forward the request to the path that will handle it
@@ -125,7 +124,7 @@ impl<S> Server<S> {
             let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponse::new(Status::NotFound, "");
+                return HttpResponse::new(Status::NotFound, "", request.version());
             };
             path_state = next_level;
 
@@ -139,7 +138,7 @@ impl<S> Server<S> {
             let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponse::new(Status::NotFound, "");
+                return HttpResponse::new(Status::NotFound, "", request.version());
             };
             path_state = next_level;
         }
@@ -148,11 +147,11 @@ impl<S> Server<S> {
         let Some(handler) = &path_state.handlers[method as usize] else {
             if any_valid_methods(&path_state.handlers) {
                 log_error!("405 Method Not Allowed: {:?} {}", method, path);
-                return HttpResponse::new(Status::MethodNotAllowed, "");
+                return HttpResponse::new(Status::MethodNotAllowed, "", request.version());
             } else {
                 // We return not found if we are at an intermediate path with no methods defined
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponse::new(Status::NotFound, "");
+                return HttpResponse::new(Status::NotFound, "", request.version());
             }
         };
 
@@ -168,7 +167,7 @@ impl<S> Server<S> {
                 Ok(req) => req,
                 Err(e) => {
                     log_error!("400 Bad Request: {}", e);
-                    return HttpResponse::new(Status::BadRequest, "").to_string();
+                    return HttpResponse::new(Status::BadRequest, "", "HTTP/1.1").to_string();
                 }
             };
             self.invoke(&request, &addr).to_string()

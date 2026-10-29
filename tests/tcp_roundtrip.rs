@@ -14,11 +14,11 @@ use builder::server::Server;
 fn start_server(port: i32) {
     thread::spawn(move || {
         let mut s = Server::new(());
-        s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-            HttpResponse::new(Status::Ok, "index")
+        s.add_endpoint(Method::Get, "/index", |request: &HttpRequest, _state: &()| -> HttpResponse {
+            HttpResponse::new(Status::Ok, "index", request.version())
         });
         s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
-            HttpResponse::new(Status::Ok, request.content())
+            HttpResponse::new(Status::Ok, request.content(), request.version())
         });
         s.run(port);
     });

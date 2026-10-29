@@ -6,8 +6,8 @@
 
 // fn server_thread(port: i32) {
 //     let mut s = Server::new(());
-//     s.add_endpoint(Method::Get, "/", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-//         HttpResponse::new(Status::Ok, "Hello, World!")
+//     s.add_endpoint(Method::Get, "/", |request: &HttpRequest, _state: &()| -> HttpResponse {
+//         HttpResponse::new(Status::Ok, "Hello, World!", request.version())
 //     });
 
 //     s.

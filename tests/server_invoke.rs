@@ -13,32 +13,32 @@ fn addr() -> IpAddress {
 // Every handler's body names the route it serves so tests can tell which one ran
 fn test_server() -> Server {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "/", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "root")
+    s.add_endpoint(Method::Get, "/", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Ok, "root", request.version())
     });
-    s.add_endpoint(Method::Get, "/about", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "about")
+    s.add_endpoint(Method::Get, "/about", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Ok, "about", request.version())
     });
     // Handlers are fn pointers and cannot capture, so each method gets its own closure
     let multi: [(Method, RequestHandler<()>); 5] = [
-        (Method::Get, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "GET")),
-        (Method::Post, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "POST")),
-        (Method::Put, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PUT")),
-        (Method::Patch, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PATCH")),
-        (Method::Delete, |_request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "DELETE")),
+        (Method::Get, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "GET", request.version())),
+        (Method::Post, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "POST", request.version())),
+        (Method::Put, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PUT", request.version())),
+        (Method::Patch, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PATCH", request.version())),
+        (Method::Delete, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "DELETE", request.version())),
     ];
     for (method, handler) in multi {
         s.add_endpoint(method, "/multi", handler);
     }
     // Leaves /a and /a/b as intermediate nodes without handlers
-    s.add_endpoint(Method::Get, "/a/b/c", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "abc")
+    s.add_endpoint(Method::Get, "/a/b/c", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Ok, "abc", request.version())
     });
     s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, request.content())
+        HttpResponse::new(Status::Ok, request.content(), request.version())
     });
     s.add_endpoint(Method::Get, "/host", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, request.header_value("host").unwrap_or("<missing>"))
+        HttpResponse::new(Status::Ok, request.header_value("host").unwrap_or("<missing>"), request.version())
     });
     s
 }
@@ -49,7 +49,7 @@ fn get(path: &str) -> String {
 }
 
 // For well formed input that HttpRequest::new must accept
-fn send(server: &Server, raw: &str) -> HttpResponse {
+fn send<'a>(server: &Server, raw: &'a str) -> HttpResponse<'a> {
     let request = HttpRequest::new(raw).expect("HttpRequest::new failed on a well formed request");
     server.invoke(&request, &addr())
 }
@@ -80,14 +80,16 @@ fn header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
 
 #[test]
 fn get_root() {
-    let response = send(&test_server(), &get("/"));
+    let raw = get("/");
+    let response = send(&test_server(), &raw);
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(response.body(), "root");
 }
 
 #[test]
 fn get_about() {
-    let response = send(&test_server(), &get("/about"));
+    let raw = get("/about");
+    let response = send(&test_server(), &raw);
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(response.body(), "about");
 }
@@ -105,7 +107,8 @@ fn each_method_reaches_its_own_handler() {
 
 #[test]
 fn nested_path_dispatches() {
-    let response = send(&test_server(), &get("/a/b/c"));
+    let raw = get("/a/b/c");
+    let response = send(&test_server(), &raw);
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(response.body(), "abc");
 }
@@ -113,21 +116,23 @@ fn nested_path_dispatches() {
 #[test]
 fn handler_status_passes_through() {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "/created", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Created, "made")
+    s.add_endpoint(Method::Get, "/created", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Created, "made", request.version())
     });
-    s.add_endpoint(Method::Get, "/error", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::InternalServerError, "oops")
+    s.add_endpoint(Method::Get, "/error", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::InternalServerError, "oops", request.version())
     });
-    s.add_endpoint(Method::Get, "/empty", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::NoContent, "")
+    s.add_endpoint(Method::Get, "/empty", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::NoContent, "", request.version())
     });
 
-    let created = send(&s, &get("/created"));
+    let raw = get("/created");
+    let created = send(&s, &raw);
     assert_eq!(created.status(), Status::Created);
     assert_eq!(created.body(), "made");
 
-    let error = send(&s, &get("/error"));
+    let raw = get("/error");
+    let error = send(&s, &raw);
     assert_eq!(error.status(), Status::InternalServerError);
     assert_eq!(error.body(), "oops");
 
@@ -148,11 +153,11 @@ fn ipv6_address_is_handled_like_ipv4() {
 #[test]
 fn duplicate_endpoint_keeps_first_handler() {
     let mut s = Server::new(());
-    assert!(s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "first")
+    assert!(s.add_endpoint(Method::Get, "/dup", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Ok, "first", request.version())
     }));
-    assert!(!s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "second")
+    assert!(!s.add_endpoint(Method::Get, "/dup", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Ok, "second", request.version())
     }));
     assert_eq!(send(&s, &get("/dup")).body(), "first");
 }
@@ -160,10 +165,11 @@ fn duplicate_endpoint_keeps_first_handler() {
 #[test]
 fn endpoint_registered_without_leading_slash() {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "about", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "about")
+    s.add_endpoint(Method::Get, "about", |request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponse::new(Status::Ok, "about", request.version())
     });
-    let response = send(&s, &get("/about"));
+    let raw = get("/about");
+    let response = send(&s, &raw);
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(response.body(), "about");
 }
@@ -456,11 +462,13 @@ fn empty_server_root_is_not_found() {
 fn query_string_is_ignored_for_routing() {
     let s = test_server();
 
-    let about = send(&s, &get("/about?x=1&y=2"));
+    let raw = get("/about?x=1&y=2");
+    let about = send(&s, &raw);
     assert_eq!(about.status(), Status::Ok);
     assert_eq!(about.body(), "about");
 
-    let root = send(&s, &get("/?"));
+    let raw = get("/?");
+    let root = send(&s, &raw);
     assert_eq!(root.status(), Status::Ok);
     assert_eq!(root.body(), "root");
 }
@@ -468,7 +476,8 @@ fn query_string_is_ignored_for_routing() {
 // RFC 9112 3.2.2: a server MUST accept the absolute-form
 #[test]
 fn absolute_form_target_is_routed() {
-    let response = send(&test_server(), &get("http://example.com/about"));
+    let raw = get("http://example.com/about");
+    let response = send(&test_server(), &raw);
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(response.body(), "about");
 }
@@ -476,7 +485,8 @@ fn absolute_form_target_is_routed() {
 // %61 is 'a'
 #[test]
 fn percent_encoded_path_is_decoded() {
-    let response = send(&test_server(), &get("/%61bout"));
+    let raw = get("/%61bout");
+    let response = send(&test_server(), &raw);
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(response.body(), "about");
 }
@@ -491,7 +501,8 @@ fn invalid_percent_escape_is_rejected() {
 fn dot_segments_are_normalized() {
     let s = test_server();
     for path in ["/x/../about", "/./about"] {
-        let response = send(&s, &get(path));
+        let raw = get(path);
+        let response = send(&s, &raw);
         assert_eq!(response.status(), Status::Ok, "path: {path}");
         assert_eq!(response.body(), "about", "path: {path}");
     }
