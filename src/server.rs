@@ -5,9 +5,10 @@ use crate::http_response::{HttpResponse, Status};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
 
-pub type RequestHandler = Box<dyn Fn(&HttpRequest<'_>) -> HttpResponse>;
+pub type RequestHandler = Box<dyn fn(&HttpRequest<'_>) -> HttpResponse>;
 
-const SUPPORTED_VERSIONS: [&str; 1] = ["HTTP/1.1"];
+const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
+const VERSION_GREATEST: &str = "HTTP/1.1";
 
 #[derive(Default)]
 struct UriLookupTable {
@@ -18,6 +19,12 @@ struct UriLookupTable {
 // Finds the next '/' in s at or after from
 fn next_slash(s: &str, from: usize) -> Option<usize> {
     s[from..].find('/').map(|i| i + from)
+}
+
+// Determines if any has a valid option
+fn any_valid_methods<T, const N: usize>
+(arr: &[Option<T>; N]) -> bool {
+    arr.iter().any(|opt| opt.is_some())
 }
 
 #[derive(Default)]
@@ -37,6 +44,7 @@ impl Server {
         callback: impl Fn(&HttpRequest<'_>) -> HttpResponse + 'static,
     ) -> bool {
         if uri.is_empty() {
+            log_error!("Cannot add an endpoint with an empty uri");
             return false;
         }
         let mut token_start = usize::from(uri.starts_with('/'));
@@ -62,6 +70,7 @@ impl Server {
         let handler = &mut current_state.handlers[method as usize];
         if handler.is_some() {
             // A handler already exists for that type
+            log_error!("A handler is already registered for {:?} {}", method, uri);
             return false;
         }
 
@@ -74,14 +83,17 @@ impl Server {
         // Make sure that the request is valid
 
         if request.parsing_error() {
+            log_error!("400 Bad Request: could not parse request for {}", request.path());
             return HttpResponse::new(Status::BadRequest, "");
         }
 
         let Some(method) = request.method() else {
+            log_error!("405 Method Not Allowed: unrecognized method for {}", request.path());
             return HttpResponse::new(Status::MethodNotAllowed, "");
         };
 
-        if !SUPPORTED_VERSIONS.contains(&request.version()) {
+        if !VERSIONS_SUPPORTED.contains(&request.version()) {
+            log_error!("400 Bad Request: unsupported version {:?} for {}", request.version(), request.path());
             return HttpResponse::new(Status::BadRequest, "");
         }
 
@@ -96,6 +108,7 @@ impl Server {
             let token = &path[token_start..s];
             let Some(next_level) = state.next.get(token) else {
                 // Path is not implemented
+                log_error!("404 Not Found: {:?} {}", method, path);
                 return HttpResponse::new(Status::NotFound, "");
             };
             state = next_level;
@@ -109,6 +122,7 @@ impl Server {
             let token = &path[token_start..];
             let Some(next_level) = state.next.get(token) else {
                 // Path is not implemented
+                log_error!("404 Not Found: {:?} {}", method, path);
                 return HttpResponse::new(Status::NotFound, "");
             };
             state = next_level;
@@ -116,16 +130,31 @@ impl Server {
 
         // Make sure that the method is actually implemented
         let Some(handler) = &state.handlers[method as usize] else {
-            return HttpResponse::new(Status::MethodNotAllowed, "");
+            if any_valid_methods(&state.handlers) {
+                log_error!("405 Method Not Allowed: {:?} {}", method, path);
+                return HttpResponse::new(Status::MethodNotAllowed, "");
+            } else {
+                // We return not found if we are at an intermediate path with no methods defined
+                log_error!("404 Not Found: {:?} {}", method, path);
+                return HttpResponse::new(Status::NotFound, "");
+            }
         };
 
         // Dispatch
-        handler(request)
+        let response = handler(request);
+        log_info!("{:?} {} -> {}", method, path, response.status() as u16);
+        response
     }
 
     pub fn run(&self, port: i32) {
         let mut listener = TcpListener::new(|request: &str, addr: IpAddress| -> String {
-            let request = HttpRequest::new(request).expect("Malformed HTTP request");
+            let request = match HttpRequest::new(request) {
+                Ok(req) => req,
+                Err(e) => {
+                    log_error!("400 Bad Request: {}", e);
+                    return HttpResponse::new(Status::BadRequest, "").to_string();
+                }
+            };
             self.invoke(&request, &addr).to_string()
         });
         listener.bind(port);

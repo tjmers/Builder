@@ -1,3 +1,4 @@
+use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
 
@@ -9,35 +10,105 @@ use crate::ip_address::IpAddress;
 #[allow(dead_code)]
 const INVALID_SOCKET: NativeSocket = -1;
 
-fn perror(s: &std::ffi::CStr) {
-    unsafe { libc::perror(s.as_ptr()) };
+// Logs the last OS error, prefixed by the call that failed
+fn log_os_error(call: &str) {
+    log_error!("{}: {}", call, io::Error::last_os_error());
 }
 
-// Reads from conn one byte at a time until a newline (kept) or until buf is full
-// Returns the number of bytes read, or <= 0 if the connection closed or errored before anything arrived
-fn recv_line(conn: NativeSocket, buf: &mut [u8]) -> isize {
-    let mut len = 0;
-    while len < buf.len() {
-        let n = unsafe { libc::recv(conn, buf[len..].as_mut_ptr() as *mut c_void, 1, 0) };
-        if n <= 0 {
-            return if len > 0 { len as isize } else { n };
-        }
+const RECV_CHUNK_BYTES: usize = 4096;
 
-        len += 1;
-        if buf[len - 1] == b'\n' {
-            break;
+// Requests over these limits are dropped
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+// Finds the end of the headers (just past the blank line), accepting CRLF or bare LF line endings
+fn header_end(buf: &[u8]) -> Option<usize> {
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+// The value of the Content-Length header, or 0 if there isn't a valid one
+fn content_length(headers: &[u8]) -> usize {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("Content-Length").then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+// Appends the next chunk received on conn to buf
+// Returns false if the connection closed or errored
+fn recv_chunk(conn: NativeSocket, chunk: &mut [u8], buf: &mut Vec<u8>) -> bool {
+    let n = unsafe { libc::recv(conn, chunk.as_mut_ptr() as *mut c_void, chunk.len(), 0) };
+    if n < 0 {
+        log_os_error("recv");
+        return false;
+    }
+    if n == 0 {
+        if buf.is_empty() {
+            log_error!("Connection closed before a request was received");
+        } else {
+            log_error!("Connection closed after {} bytes, before the full request was received", buf.len());
+        }
+        return false;
+    }
+    buf.extend_from_slice(&chunk[..n as usize]);
+    true
+}
+
+// Reads one full request from conn: the request line and headers, then Content-Length bytes of body
+// Returns None if the connection closed or errored first, or if the request is too large
+fn recv_request(conn: NativeSocket) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; RECV_CHUNK_BYTES];
+
+    let header_len = loop {
+        if let Some(end) = header_end(&buf) {
+            break end;
+        }
+        if buf.len() > MAX_HEADER_BYTES {
+            log_error!("Request headers exceed {} bytes", MAX_HEADER_BYTES);
+            return None;
+        }
+        if !recv_chunk(conn, &mut chunk, &mut buf) {
+            return None;
+        }
+    };
+
+    let body_len = content_length(&buf[..header_len]);
+    if body_len > MAX_BODY_BYTES {
+        log_error!("Request body of {} bytes exceeds {} bytes", body_len, MAX_BODY_BYTES);
+        return None;
+    }
+
+    let total = header_len + body_len;
+    while buf.len() < total {
+        if !recv_chunk(conn, &mut chunk, &mut buf) {
+            return None;
         }
     }
-    len as isize
+    // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
+    buf.truncate(total);
+    Some(buf)
 }
 
 // Sends all of data, retrying on partial sends
 fn send_all(conn: NativeSocket, data: &[u8]) -> bool {
     let mut sent = 0;
     while sent < data.len() {
-        let n = unsafe { libc::send(conn, data[sent..].as_ptr() as *const c_void, data.len() - sent, 0) };
+        // MSG_NOSIGNAL so a client that already hung up gives an error instead of a SIGPIPE that kills the server
+        let n = unsafe {
+            libc::send(conn, data[sent..].as_ptr() as *const c_void, data.len() - sent, libc::MSG_NOSIGNAL)
+        };
         if n <= 0 {
-            perror(c"send");
+            log_os_error("send");
             return false;
         }
         sent += n as usize;
@@ -50,7 +121,7 @@ impl<'a> TcpListener<'a> {
         // Create the socket but do not start listening
         let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         if socket < 0 {
-            perror(c"socket");
+            log_os_error("socket");
         }
 
         TcpListener {
@@ -89,7 +160,7 @@ impl<'a> TcpListener<'a> {
             )
         };
         if bind_status < 0 {
-            perror(c"bind");
+            log_os_error("bind");
             self.socket = bind_status;
             return false;
         }
@@ -108,10 +179,10 @@ impl<'a> TcpListener<'a> {
         }
         let listen_status = unsafe { libc::listen(self.socket, libc::SOMAXCONN) };
         if listen_status < 0 {
-            perror(c"listen");
+            log_os_error("listen");
             return false;
         }
-        println!("Now serving on port {}", self.port);
+        log_info!("Now serving on port {}", self.port);
 
         loop {
             let mut client: sockaddr_in = unsafe { mem::zeroed() };
@@ -124,21 +195,17 @@ impl<'a> TcpListener<'a> {
                 )
             };
             if conn < 0 {
-                perror(c"accept");
+                log_os_error("accept");
                 // If there is an error here do not shut down the server just continue
                 continue;
             }
 
             let ip = Ipv4Addr::from(u32::from_be(client.sin_addr.s_addr));
 
-            println!("Connection from {}:{}", ip, u16::from_be(client.sin_port));
+            log_info!("Connection from {}:{}", ip, u16::from_be(client.sin_port));
 
-            let mut buf = [0u8; 256];
-            let n = recv_line(conn, &mut buf);
-            if n > 0 {
-                let line = &buf[..n as usize];
-                let end = line.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(line.len());
-                let request = String::from_utf8_lossy(&line[..end]);
+            if let Some(request) = recv_request(conn) {
+                let request = String::from_utf8_lossy(&request);
                 // This is a request -- call the request handler
                 let response = (self.handler)(&request, IpAddress::from(ip.octets()));
 
