@@ -1,5 +1,5 @@
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use builder::ip_address::IpAddress;
 use builder::server::Server;
 
@@ -7,10 +7,10 @@ use builder::server::Server;
 fn hello_world1() {
     let mut s = Server::new(());
     s.add_endpoint(Method::Get, "/", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "Hello, World!", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "Hello, World!", request.version()).build()
     });
     s.add_endpoint(Method::Get, "/about", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "My name is Jacob", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "My name is Jacob", request.version()).build()
     });
 
     // Create a HTTP request and get the reponse
@@ -27,6 +27,6 @@ fn hello_world1() {
     let a = s.invoke(&request1, &addr);
     let b = s.invoke(&request2, &addr);
 
-    assert!(a.status() as u16 == 200 && a.body() == b"Hello, World!");
-    assert!(b.status() as u16 == 200 && b.body() == b"My name is Jacob");
+    assert!(a.status_code() == 200 && a.body() == b"Hello, World!");
+    assert!(b.status_code() == 200 && b.body() == b"My name is Jacob");
 }

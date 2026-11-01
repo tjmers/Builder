@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use builder::server::Server;
 
 // Starts a server on port in the background
@@ -15,10 +15,10 @@ fn start_server(port: i32) {
     thread::spawn(move || {
         let mut s = Server::new(());
         s.add_endpoint(Method::Get, "/index", |request: &HttpRequest, _state: &()| -> HttpResponse {
-            HttpResponse::new(Status::Ok, "index", request.version())
+            HttpResponseBuilder::from_text(Status::Ok, "index", request.version()).build()
         });
         s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
-            HttpResponse::new(Status::Ok, request.content(), request.version())
+            HttpResponseBuilder::from_text(Status::Ok, request.content(), request.version()).build()
         });
         s.run(port);
     });

@@ -1,7 +1,7 @@
 
 use builder::server::Server;
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use builder::logger::LOGGER;
 
 fn main() {
@@ -9,7 +9,7 @@ fn main() {
   let mut s = Server::new(());
 
   s.add_endpoint(Method::Get, "/index", |request: &HttpRequest, _: &()| -> HttpResponse {
-    HttpResponse::new(Status::Ok, "Response", request.version())
+    HttpResponseBuilder::from_text(Status::Ok, "Response", request.version()).build()
   });
 
   s.run(2002);

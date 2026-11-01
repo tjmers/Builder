@@ -2,7 +2,7 @@
 // Many of these are expected to fail until invoke and HttpRequest::new implement the full behavior
 
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use builder::ip_address::IpAddress;
 use builder::server::{RequestHandler, Server};
 
@@ -14,31 +14,31 @@ fn addr() -> IpAddress {
 fn test_server() -> Server {
     let mut s = Server::new(());
     s.add_endpoint(Method::Get, "/", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "root", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "root", request.version()).build()
     });
     s.add_endpoint(Method::Get, "/about", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "about", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "about", request.version()).build()
     });
     // Handlers are fn pointers and cannot capture, so each method gets its own closure
     let multi: [(Method, RequestHandler<()>); 5] = [
-        (Method::Get, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "GET", request.version())),
-        (Method::Post, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "POST", request.version())),
-        (Method::Put, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PUT", request.version())),
-        (Method::Patch, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "PATCH", request.version())),
-        (Method::Delete, |request: &HttpRequest, _state: &()| HttpResponse::new(Status::Ok, "DELETE", request.version())),
+        (Method::Get, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "GET", request.version()).build()),
+        (Method::Post, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "POST", request.version()).build()),
+        (Method::Put, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "PUT", request.version()).build()),
+        (Method::Patch, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "PATCH", request.version()).build()),
+        (Method::Delete, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "DELETE", request.version()).build()),
     ];
     for (method, handler) in multi {
         s.add_endpoint(method, "/multi", handler);
     }
     // Leaves /a and /a/b as intermediate nodes without handlers
     s.add_endpoint(Method::Get, "/a/b/c", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "abc", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "abc", request.version()).build()
     });
     s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, request.content(), request.version())
+        HttpResponseBuilder::from_text(Status::Ok, request.content(), request.version()).build()
     });
     s.add_endpoint(Method::Get, "/host", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, request.header_value("host").unwrap_or("<missing>"), request.version())
+        HttpResponseBuilder::from_text(Status::Ok, request.header_value("host").unwrap_or("<missing>"), request.version()).build()
     });
     s
 }
@@ -49,29 +49,20 @@ fn get(path: &str) -> String {
 }
 
 // For well formed input that HttpRequest::new must accept
-fn send<'a>(server: &Server, raw: &'a str) -> HttpResponse<'a> {
+fn send(server: &Server, raw: &str) -> HttpResponse {
     let request = HttpRequest::new(raw).expect("HttpRequest::new failed on a well formed request");
     server.invoke(&request, &addr())
 }
 
 fn assert_status(server: &Server, raw: &str, expected: Status) {
-    assert_eq!(send(server, raw).status(), expected, "request: {raw:?}");
+    assert_eq!(send(server, raw).status_code(), expected as u16, "request: {raw:?}");
 }
 
 // For malformed input: either HttpRequest::new rejects it, or invoke responds with expected
 fn assert_rejected(server: &Server, raw: &str, expected: Status) {
     if let Ok(request) = HttpRequest::new(raw) {
-        assert_eq!(server.invoke(&request, &addr()).status(), expected, "request: {raw:?}");
+        assert_eq!(server.invoke(&request, &addr()).status_code(), expected as u16, "request: {raw:?}");
     }
-}
-
-// Header names are case-insensitive
-fn header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
-    response
-        .headers()
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +73,7 @@ fn header<'a>(response: &'a HttpResponse, name: &str) -> Option<&'a str> {
 fn get_root() {
     let raw = get("/");
     let response = send(&test_server(), &raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"root");
 }
 
@@ -90,7 +81,7 @@ fn get_root() {
 fn get_about() {
     let raw = get("/about");
     let response = send(&test_server(), &raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -100,7 +91,7 @@ fn each_method_reaches_its_own_handler() {
     for name in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
         let raw = format!("{name} /multi HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n");
         let response = send(&s, &raw);
-        assert_eq!(response.status(), Status::Ok, "method: {name}");
+        assert_eq!(response.status_code(), Status::Ok as u16, "method: {name}");
         assert_eq!(response.body(), name.as_bytes());
     }
 }
@@ -109,7 +100,7 @@ fn each_method_reaches_its_own_handler() {
 fn nested_path_dispatches() {
     let raw = get("/a/b/c");
     let response = send(&test_server(), &raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"abc");
 }
 
@@ -117,26 +108,26 @@ fn nested_path_dispatches() {
 fn handler_status_passes_through() {
     let mut s = Server::new(());
     s.add_endpoint(Method::Get, "/created", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Created, "made", request.version())
+        HttpResponseBuilder::from_text(Status::Created, "made", request.version()).build()
     });
     s.add_endpoint(Method::Get, "/error", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::InternalServerError, "oops", request.version())
+        HttpResponseBuilder::from_text(Status::InternalServerError, "oops", request.version()).build()
     });
     s.add_endpoint(Method::Get, "/empty", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::NoContent, "", request.version())
+        HttpResponseBuilder::from_text(Status::NoContent, "", request.version()).build()
     });
 
     let raw = get("/created");
     let created = send(&s, &raw);
-    assert_eq!(created.status(), Status::Created);
+    assert_eq!(created.status_code(), Status::Created as u16);
     assert_eq!(created.body(), b"made");
 
     let raw = get("/error");
     let error = send(&s, &raw);
-    assert_eq!(error.status(), Status::InternalServerError);
+    assert_eq!(error.status_code(), Status::InternalServerError as u16);
     assert_eq!(error.body(), b"oops");
 
-    assert_eq!(send(&s, &get("/empty")).status(), Status::NoContent);
+    assert_eq!(send(&s, &get("/empty")).status_code(), Status::NoContent as u16);
 }
 
 #[test]
@@ -146,7 +137,7 @@ fn ipv6_address_is_handled_like_ipv4() {
     let request = HttpRequest::new(&raw).unwrap();
     let v6 = IpAddress::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     let response = s.invoke(&request, &v6);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -154,10 +145,10 @@ fn ipv6_address_is_handled_like_ipv4() {
 fn duplicate_endpoint_keeps_first_handler() {
     let mut s = Server::new(());
     assert!(s.add_endpoint(Method::Get, "/dup", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "first", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "first", request.version()).build()
     }));
     assert!(!s.add_endpoint(Method::Get, "/dup", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "second", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "second", request.version()).build()
     }));
     assert_eq!(send(&s, &get("/dup")).body(), b"first");
 }
@@ -166,18 +157,18 @@ fn duplicate_endpoint_keeps_first_handler() {
 fn endpoint_registered_without_leading_slash() {
     let mut s = Server::new(());
     s.add_endpoint(Method::Get, "about", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponse::new(Status::Ok, "about", request.version())
+        HttpResponseBuilder::from_text(Status::Ok, "about", request.version()).build()
     });
     let raw = get("/about");
     let response = send(&s, &raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
 #[test]
 fn bare_lf_line_endings_are_accepted() {
     let response = send(&test_server(), "GET /about HTTP/1.1\nHost: example.com\n\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -252,7 +243,7 @@ fn request_target_without_leading_slash_is_rejected() {
 #[test]
 fn leading_empty_line_is_ignored() {
     let response = send(&test_server(), "\r\nGET /about HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -301,9 +292,9 @@ fn known_method_without_handler_is_not_allowed() {
 fn method_not_allowed_lists_allowed_methods() {
     let raw = "POST /about HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
     let response = send(&test_server(), raw);
-    assert_eq!(response.status(), Status::MethodNotAllowed);
+    assert_eq!(response.status_code(), Status::MethodNotAllowed as u16);
 
-    let allow = header(&response, "Allow").expect("405 response is missing the Allow header");
+    let allow = response.header("Allow").expect("405 response is missing the Allow header");
     let methods: Vec<&str> = allow.split(',').map(str::trim).collect();
     assert!(methods.contains(&"GET"), "Allow: {allow}");
     assert!(!methods.contains(&"POST"), "Allow: {allow}");
@@ -313,7 +304,7 @@ fn method_not_allowed_lists_allowed_methods() {
 #[test]
 fn head_on_get_route_has_no_body() {
     let response = send(&test_server(), "HEAD /about HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"");
 }
 
@@ -347,7 +338,7 @@ fn malformed_version_is_rejected() {
 #[test]
 fn http_1_0_is_accepted() {
     let response = send(&test_server(), "GET /about HTTP/1.0\r\nHost: example.com\r\n\r\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -406,14 +397,14 @@ fn bare_cr_in_header_value_is_rejected() {
 #[test]
 fn header_names_are_case_insensitive() {
     let response = send(&test_server(), "GET /host HTTP/1.1\r\nHOST: example.com\r\n\r\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"example.com");
 }
 
 #[test]
 fn header_value_whitespace_is_trimmed() {
     let response = send(&test_server(), "GET /host HTTP/1.1\r\nhost: \t example.com \t\r\n\r\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"example.com");
 }
 
@@ -464,12 +455,12 @@ fn query_string_is_ignored_for_routing() {
 
     let raw = get("/about?x=1&y=2");
     let about = send(&s, &raw);
-    assert_eq!(about.status(), Status::Ok);
+    assert_eq!(about.status_code(), Status::Ok as u16);
     assert_eq!(about.body(), b"about");
 
     let raw = get("/?");
     let root = send(&s, &raw);
-    assert_eq!(root.status(), Status::Ok);
+    assert_eq!(root.status_code(), Status::Ok as u16);
     assert_eq!(root.body(), b"root");
 }
 
@@ -478,7 +469,7 @@ fn query_string_is_ignored_for_routing() {
 fn absolute_form_target_is_routed() {
     let raw = get("http://example.com/about");
     let response = send(&test_server(), &raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -487,7 +478,7 @@ fn absolute_form_target_is_routed() {
 fn percent_encoded_path_is_decoded() {
     let raw = get("/%61bout");
     let response = send(&test_server(), &raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"about");
 }
 
@@ -503,7 +494,7 @@ fn dot_segments_are_normalized() {
     for path in ["/x/../about", "/./about"] {
         let raw = get(path);
         let response = send(&s, &raw);
-        assert_eq!(response.status(), Status::Ok, "path: {path}");
+        assert_eq!(response.status_code(), Status::Ok as u16, "path: {path}");
         assert_eq!(response.body(), b"about", "path: {path}");
     }
 }
@@ -516,14 +507,14 @@ fn dot_segments_are_normalized() {
 fn body_is_passed_to_handler() {
     let raw = "POST /echo HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
     let response = send(&test_server(), raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"hello");
 }
 
 #[test]
 fn missing_body_is_empty() {
     let response = send(&test_server(), "POST /echo HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"");
 }
 
@@ -531,7 +522,7 @@ fn missing_body_is_empty() {
 fn body_is_limited_to_content_length() {
     let raw = "POST /echo HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhelloworld";
     let response = send(&test_server(), raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"hello");
 }
 
@@ -574,6 +565,6 @@ fn unsupported_transfer_encoding_is_not_implemented() {
 fn chunked_body_is_decoded() {
     let raw = "POST /echo HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let response = send(&test_server(), raw);
-    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.status_code(), Status::Ok as u16);
     assert_eq!(response.body(), b"hello");
 }

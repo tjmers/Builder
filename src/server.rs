@@ -2,11 +2,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::http_request::{HttpRequest, Method};
-use crate::http_response::{HttpResponse, Status};
+use crate::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
 
-pub type RequestHandler<S> = for <'r, 'a> fn(&'r HttpRequest<'a>, &S) -> HttpResponse<'a>;
+pub type RequestHandler<S> = for <'r, 'a> fn(&'r HttpRequest<'a>, &S) -> HttpResponse;
 
 const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
 
@@ -106,22 +106,22 @@ impl<S> Server<S> {
         &self,
         request: &HttpRequest<'a>,
         _address: &IpAddress
-        ) -> HttpResponse<'a> {
+        ) -> HttpResponse {
         // The parser only accepts well formed versions, so anything else here is just unsupported
         if !VERSIONS_SUPPORTED.contains(&request.version()) {
             log_error!("505 HTTP Version Not Supported: {:?} for {}", request.version(), request.path());
-            return HttpResponse::new(Status::HttpVersionNotSupported, "", "HTTP/1.1");
+            return HttpResponseBuilder::new(Status::HttpVersionNotSupported, "HTTP/1.1").build();
         }
 
         let Some(method) = request.method() else {
             log_error!("501 Not Implemented: unrecognized method for {}", request.path());
-            return HttpResponse::new(Status::NotImplemented, "", request.version());
+            return HttpResponseBuilder::new(Status::NotImplemented, request.version()).build();
         };
 
         // RFC 9112 6.1: only the chunked transfer coding is understood
         if request.header_value("transfer-encoding").is_some_and(|coding| !coding.eq_ignore_ascii_case("chunked")) {
             log_error!("501 Not Implemented: unsupported transfer coding for {}", request.path());
-            return HttpResponse::new(Status::NotImplemented, "", request.version());
+            return HttpResponseBuilder::new(Status::NotImplemented, request.version()).build();
         }
 
         // Forward the request to the path that will handle it
@@ -136,7 +136,7 @@ impl<S> Server<S> {
             let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponse::new(Status::NotFound, "", request.version());
+                return HttpResponseBuilder::new(Status::NotFound, request.version()).build();
             };
             path_state = next_level;
 
@@ -150,7 +150,7 @@ impl<S> Server<S> {
             let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponse::new(Status::NotFound, "", request.version());
+                return HttpResponseBuilder::new(Status::NotFound, request.version()).build();
             };
             path_state = next_level;
         }
@@ -163,25 +163,23 @@ impl<S> Server<S> {
             if any_valid_methods(&path_state.handlers) {
                 log_error!("405 Method Not Allowed: {:?} {}", method, path);
                 // RFC 9110 15.5.6: a 405 must list the methods that are allowed
-                let mut response = HttpResponse::new(Status::MethodNotAllowed, "", request.version());
+                let mut response = HttpResponseBuilder::new(Status::MethodNotAllowed, request.version());
                 response.headers_mut().insert("Allow".to_owned(), allowed_methods(&path_state.handlers));
-                return response;
+                return response.build();
             } else {
                 // We return not found if we are at an intermediate path with no methods defined
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponse::new(Status::NotFound, "", request.version());
+                return HttpResponseBuilder::new(Status::NotFound, request.version()).build();
             }
         };
 
         // Dispatch
         let mut response = handler(request, &self.state);
         if method == Method::Head {
-            // Keep the Content-Length the GET would have sent
-            let length = response.body().len().to_string();
-            response.headers_mut().entry("Content-Length".to_owned()).or_insert(length);
-            response.body_mut().clear();
+            // The head already has the Content-Length the GET would have sent
+            response.strip_body();
         }
-        log_info!("{:?} {} -> {}", method, path, response.status() as u16);
+        log_info!("{:?} {} -> {}", method, path, response.status_code());
         response
     }
 
@@ -194,11 +192,11 @@ impl<S> Server<S> {
             Ok(req) => req,
             Err(e) => {
                 log_error!("400 Bad Request: {}", e);
-                return Cow::Owned(HttpResponse::new(Status::BadRequest, "", "HTTP/1.1").response());
+                return Cow::Owned(HttpResponseBuilder::new(Status::BadRequest, "HTTP/1.1").build().into_bytes());
             }
         };
         // A cache lookup would go here and return Cow::Borrowed for a hit
-        Cow::Owned(self.invoke(&request, &addr).response())
+        Cow::Owned(self.invoke(&request, &addr).into_bytes())
     }
 
     pub fn run(&self, port: i32) {
