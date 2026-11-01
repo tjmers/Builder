@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 
 use libc::{c_int, c_void, sockaddr, sockaddr_in, socklen_t};
 
-use super::{NativeSocket, TcpListener};
+use super::{NativeSocket, RawRequestHandler, TcpListener};
 use crate::ip_address::IpAddress;
 
 #[allow(dead_code)]
@@ -34,8 +34,8 @@ pub(super) fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
-impl<'a> TcpListener<'a> {
-    pub fn new(handler: impl Fn(&str, IpAddress) -> String + 'a) -> Self {
+impl<'a, C> TcpListener<'a, C> {
+    pub fn new(context: &'a C, handler: RawRequestHandler<'a, C>) -> Self {
         // Create the socket but do not start listening
         let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         if socket < 0 {
@@ -44,7 +44,8 @@ impl<'a> TcpListener<'a> {
 
         TcpListener {
             socket,
-            handler: Box::new(handler),
+            handler,
+            context,
             port: -1,
         }
     }
@@ -129,7 +130,7 @@ impl<'a> TcpListener<'a> {
     }
 }
 
-impl Drop for TcpListener<'_> {
+impl<C> Drop for TcpListener<'_, C> {
     fn drop(&mut self) {
         if self.socket >= 0 {
             unsafe { libc::close(self.socket) };

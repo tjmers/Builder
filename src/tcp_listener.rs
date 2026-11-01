@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::ip_address::IpAddress;
 
 #[cfg(windows)]
@@ -20,11 +22,16 @@ mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-pub type RequestHandler<'a> = Box<dyn Fn(&str, IpAddress) -> String + 'a>;
+// Takes the listener's context (e.g. the server), the raw request bytes, and the client address,
+// and returns the raw response bytes to send
+// A cached response is returned as Cow::Borrowed from the context so it is sent straight from the cache
+// without being copied, and a freshly built one as Cow::Owned
+pub type RawRequestHandler<'a, C> = fn(&'a C, &[u8], IpAddress) -> Cow<'a, [u8]>;
 
-pub struct TcpListener<'a> {
+pub struct TcpListener<'a, C> {
     socket: NativeSocket,
-    handler: RequestHandler<'a>,
+    handler: RawRequestHandler<'a, C>,
+    context: &'a C,
     port: i32,
 }
 
@@ -133,17 +140,17 @@ fn send_all(conn: NativeSocket, data: &[u8]) -> bool {
     true
 }
 
-impl TcpListener<'_> {
+impl<C> TcpListener<'_, C> {
     // Reads one request from an accepted connection and sends back the handler's response
     // The caller is responsible for closing conn
     fn serve(&self, conn: NativeSocket, ip: IpAddress) {
         if let Some(request) = recv_request(conn) {
-            let request = String::from_utf8_lossy(&request);
             // This is a request -- call the request handler
-            let response = (self.handler)(&request, ip);
+            let response = (self.handler)(self.context, &request, ip);
 
             // Send back the response
-            send_all(conn, response.as_bytes());
+            // The only copy is the one send makes into the kernel's socket buffer
+            send_all(conn, &response);
         }
     }
 }

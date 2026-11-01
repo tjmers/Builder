@@ -27,6 +27,6 @@ fn hello_world1() {
     let a = s.invoke(&request1, &addr);
     let b = s.invoke(&request2, &addr);
 
-    assert!(a.status() as u16 == 200 && a.body() == "Hello, World!");
-    assert!(b.status() as u16 == 200 && b.body() == "My name is Jacob");
+    assert!(a.status() as u16 == 200 && a.body() == b"Hello, World!");
+    assert!(b.status() as u16 == 200 && b.body() == b"My name is Jacob");
 }

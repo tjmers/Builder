@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::http_request::{HttpRequest, Method};
@@ -184,17 +185,24 @@ impl<S> Server<S> {
         response
     }
 
+    // The listener's raw request handler: parses the request bytes and returns the response bytes to send
+    // A cached response is returned as Cow::Borrowed from self, so the only copy is the one send makes
+    fn handle_raw<'s>(&'s self, request: &[u8], addr: IpAddress) -> Cow<'s, [u8]> {
+        // Borrows the bytes when they are valid UTF-8, and only copies to replace invalid sequences
+        let request = String::from_utf8_lossy(request);
+        let request = match HttpRequest::new(&request) {
+            Ok(req) => req,
+            Err(e) => {
+                log_error!("400 Bad Request: {}", e);
+                return Cow::Owned(HttpResponse::new(Status::BadRequest, "", "HTTP/1.1").response());
+            }
+        };
+        // A cache lookup would go here and return Cow::Borrowed for a hit
+        Cow::Owned(self.invoke(&request, &addr).response())
+    }
+
     pub fn run(&self, port: i32) {
-        let mut listener = TcpListener::new(|request: &str, addr: IpAddress| -> String {
-            let request = match HttpRequest::new(request) {
-                Ok(req) => req,
-                Err(e) => {
-                    log_error!("400 Bad Request: {}", e);
-                    return HttpResponse::new(Status::BadRequest, "", "HTTP/1.1").to_string();
-                }
-            };
-            self.invoke(&request, &addr).to_string()
-        });
+        let mut listener = TcpListener::new(self, Self::handle_raw);
         listener.bind(port);
         listener.run();
     }

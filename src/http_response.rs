@@ -83,12 +83,12 @@ fn allows_body(status: Status) -> bool {
 pub struct HttpResponse<'a> {
     status: Status,
     headers: HashMap<String, String>,
-    body: String,
+    body: Vec<u8>,
     version: &'a str,
 }
 
 impl<'a> HttpResponse<'a> {
-    pub fn new(status: Status, body: impl Into<String>, version: &'a str) -> Self {
+    pub fn new(status: Status, body: impl Into<Vec<u8>>, version: &'a str) -> Self {
         HttpResponse {
             status,
             headers: HashMap::new(),
@@ -109,22 +109,22 @@ impl<'a> HttpResponse<'a> {
         &mut self.headers
     }
 
-    pub fn body(&self) -> &str {
+    pub fn body(&self) -> &Vec<u8> {
         &self.body
     }
 
-    pub fn body_mut(&mut self) -> &mut String {
+    pub fn body_mut(&mut self) -> &mut Vec<u8> {
         &mut self.body
     }
 
-    // Formats the full HTTP/1.1 response (status line, headers, blank line, body) ready to send
+    // Formats the full HTTP response (status line, headers, blank line, body) ready to send
     // Adds a Content-Length header if one wasn't set (and the status allows a body)
-    #[allow(clippy::inherent_to_string)]
-    pub fn to_string(&self) -> String {
+    // Consumes self so the head is written into the body's buffer instead of a new allocation
+    pub fn response(self) -> Vec<u8> {
         let has_body = allows_body(self.status);
 
         // Status line: VERSION SP CODE SP REASON
-        let mut response = format!("{} {} {}\r\n", self.version, self.status as u16, reason_phrase(self.status));
+        let mut head = format!("{} {} {}\r\n", self.version, self.status as u16, reason_phrase(self.status));
 
         // Headers: KEY: VALUE
         let mut has_content_length = false;
@@ -137,23 +137,25 @@ impl<'a> HttpResponse<'a> {
                 has_content_length = true;
             }
 
-            response.push_str(key);
-            response.push_str(": ");
-            response.push_str(value);
-            response.push_str("\r\n");
+            head.push_str(key);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
         }
 
         if has_body && !has_content_length {
-            response.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+            head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
         }
 
         // Blank line separates headers from the body
-        response.push_str("\r\n");
+        head.push_str("\r\n");
 
-        if has_body {
-            response.push_str(&self.body);
+        let mut response = self.body;
+        if !has_body {
+            response.clear();
         }
-
+        // Shifts the body back in place and writes the head in front of it
+        response.splice(0..0, head.into_bytes());
         response
     }
 }

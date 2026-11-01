@@ -8,7 +8,7 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INADDR_ANY, INVALID_SOCKET, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR, SOCK_STREAM, WSADATA,
 };
 
-use super::{NativeSocket, TcpListener};
+use super::{NativeSocket, RawRequestHandler, TcpListener};
 use crate::ip_address::IpAddress;
 
 // Winsock 2.2
@@ -64,8 +64,8 @@ pub(super) fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
-impl<'a> TcpListener<'a> {
-    pub fn new(handler: impl Fn(&str, IpAddress) -> String + 'a) -> Self {
+impl<'a, C> TcpListener<'a, C> {
+    pub fn new(context: &'a C, handler: RawRequestHandler<'a, C>) -> Self {
         // Create the socket but do not start listening
         let socket = if startup() {
             let socket = unsafe { socket(AF_INET as i32, SOCK_STREAM, 0) };
@@ -79,7 +79,8 @@ impl<'a> TcpListener<'a> {
 
         TcpListener {
             socket,
-            handler: Box::new(handler),
+            handler,
+            context,
             port: -1,
         }
     }
@@ -158,7 +159,7 @@ impl<'a> TcpListener<'a> {
     }
 }
 
-impl Drop for TcpListener<'_> {
+impl<C> Drop for TcpListener<'_, C> {
     fn drop(&mut self) {
         if self.socket != INVALID_SOCKET {
             unsafe { closesocket(self.socket) };
