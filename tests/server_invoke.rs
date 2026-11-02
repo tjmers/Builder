@@ -13,32 +13,32 @@ fn addr() -> IpAddress {
 // Every handler's body names the route it serves so tests can tell which one ran
 fn test_server() -> Server {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "/", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, "root", request.version()).build()
+    s.add_endpoint(Method::Get, "/", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Ok, "root").build()
     });
-    s.add_endpoint(Method::Get, "/about", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, "about", request.version()).build()
+    s.add_endpoint(Method::Get, "/about", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Ok, "about").build()
     });
     // Handlers are fn pointers and cannot capture, so each method gets its own closure
     let multi: [(Method, RequestHandler<()>); 5] = [
-        (Method::Get, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "GET", request.version()).build()),
-        (Method::Post, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "POST", request.version()).build()),
-        (Method::Put, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "PUT", request.version()).build()),
-        (Method::Patch, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "PATCH", request.version()).build()),
-        (Method::Delete, |request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "DELETE", request.version()).build()),
+        (Method::Get, |_request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "GET").build()),
+        (Method::Post, |_request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "POST").build()),
+        (Method::Put, |_request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "PUT").build()),
+        (Method::Patch, |_request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "PATCH").build()),
+        (Method::Delete, |_request: &HttpRequest, _state: &()| HttpResponseBuilder::from_text(Status::Ok, "DELETE").build()),
     ];
     for (method, handler) in multi {
         s.add_endpoint(method, "/multi", handler);
     }
     // Leaves /a and /a/b as intermediate nodes without handlers
-    s.add_endpoint(Method::Get, "/a/b/c", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, "abc", request.version()).build()
+    s.add_endpoint(Method::Get, "/a/b/c", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Ok, "abc").build()
     });
     s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, request.content(), request.version()).build()
+        HttpResponseBuilder::from_text(Status::Ok, request.content()).build()
     });
     s.add_endpoint(Method::Get, "/host", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, request.header_value("host").unwrap_or("<missing>"), request.version()).build()
+        HttpResponseBuilder::from_text(Status::Ok, request.header_value("host").unwrap_or("<missing>")).build()
     });
     s
 }
@@ -107,14 +107,14 @@ fn nested_path_dispatches() {
 #[test]
 fn handler_status_passes_through() {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "/created", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Created, "made", request.version()).build()
+    s.add_endpoint(Method::Get, "/created", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Created, "made").build()
     });
-    s.add_endpoint(Method::Get, "/error", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::InternalServerError, "oops", request.version()).build()
+    s.add_endpoint(Method::Get, "/error", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::InternalServerError, "oops").build()
     });
-    s.add_endpoint(Method::Get, "/empty", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::NoContent, "", request.version()).build()
+    s.add_endpoint(Method::Get, "/empty", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::NoContent, "").build()
     });
 
     let raw = get("/created");
@@ -144,11 +144,11 @@ fn ipv6_address_is_handled_like_ipv4() {
 #[test]
 fn duplicate_endpoint_keeps_first_handler() {
     let mut s = Server::new(());
-    assert!(s.add_endpoint(Method::Get, "/dup", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, "first", request.version()).build()
+    assert!(s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Ok, "first").build()
     }));
-    assert!(!s.add_endpoint(Method::Get, "/dup", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, "second", request.version()).build()
+    assert!(!s.add_endpoint(Method::Get, "/dup", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Ok, "second").build()
     }));
     assert_eq!(send(&s, &get("/dup")).body(), b"first");
 }
@@ -156,8 +156,8 @@ fn duplicate_endpoint_keeps_first_handler() {
 #[test]
 fn endpoint_registered_without_leading_slash() {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "about", |request: &HttpRequest, _state: &()| -> HttpResponse {
-        HttpResponseBuilder::from_text(Status::Ok, "about", request.version()).build()
+    s.add_endpoint(Method::Get, "about", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+        HttpResponseBuilder::from_text(Status::Ok, "about").build()
     });
     let raw = get("/about");
     let response = send(&s, &raw);

@@ -75,9 +75,9 @@ fn text_try_from_file_missing() {
 fn text_served_by_endpoint() {
     const CSS: &str = "h1 { margin: 0; }";
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "/style.css", |request: &HttpRequest, _state: &()| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/style.css", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         let file = TextFile::new(CSS, TextType::Css);
-        HttpResponseBuilder::from_text_file(Status::Ok, file, request.version()).build()
+        HttpResponseBuilder::from_text_file(Status::Ok, file).build()
     });
 
     let request = HttpRequest::new("GET /style.css HTTP/1.1\r\nHost: www.example.com\r\n\r\n").unwrap();
@@ -93,7 +93,7 @@ fn text_served_by_endpoint() {
 fn text_result_ok_and_error() {
     let html = b"<p>hi</p>";
     let path = temp_file("a.html", html);
-    let ok = HttpResponseBuilder::from_text_file_result(Status::Ok, TextFile::try_from(&path), "HTTP/1.1").build();
+    let ok = HttpResponseBuilder::from_text_file_result(Status::Ok, TextFile::try_from(&path)).build();
     std::fs::remove_file(&path).unwrap();
 
     assert_eq!(ok.status_code(), 200);
@@ -101,7 +101,7 @@ fn text_result_ok_and_error() {
     assert_eq!(ok.body(), html);
 
     let missing = TextFile::try_from("definitely_missing_builder_page.html");
-    let err = HttpResponseBuilder::from_text_file_result(Status::Ok, missing, "HTTP/1.1").build();
+    let err = HttpResponseBuilder::from_text_file_result(Status::Ok, missing).build();
     assert_eq!(err.status_code(), 500);
     assert!(err.body().is_empty());
 }

@@ -2,14 +2,12 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::http_request::{HttpRequest, Method};
-use crate::http_response::{HttpResponse, HttpResponseBuilder, Status};
+use crate::http_response::{HttpResponse, HttpResponseBuilder, Status, VERSIONS_SUPPORTED};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
 
 // The response may borrow from the state, so a handler can return a response cached there without copying it
 pub type RequestHandler<S> = for <'r, 'a, 's> fn(&'r HttpRequest<'a>, &'s S) -> HttpResponse<'s>;
-
-const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
 
 struct UriLookupTable<S> {
     handlers: [Option<RequestHandler<S>>; Method::COUNT],
@@ -112,18 +110,18 @@ impl<S> Server<S> {
         // The parser only accepts well formed versions, so anything else here is just unsupported
         if !VERSIONS_SUPPORTED.contains(&request.version()) {
             log_error!("505 HTTP Version Not Supported: {:?} for {}", request.version(), request.path());
-            return HttpResponseBuilder::new(Status::HttpVersionNotSupported, "HTTP/1.1").build();
+            return HttpResponseBuilder::new(Status::HttpVersionNotSupported).build();
         }
 
         let Some(method) = request.method() else {
             log_error!("501 Not Implemented: unrecognized method for {}", request.path());
-            return HttpResponseBuilder::new(Status::NotImplemented, request.version()).build();
+            return HttpResponseBuilder::new(Status::NotImplemented).build();
         };
 
         // RFC 9112 6.1: only the chunked transfer coding is understood
         if request.header_value("transfer-encoding").is_some_and(|coding| !coding.eq_ignore_ascii_case("chunked")) {
             log_error!("501 Not Implemented: unsupported transfer coding for {}", request.path());
-            return HttpResponseBuilder::new(Status::NotImplemented, request.version()).build();
+            return HttpResponseBuilder::new(Status::NotImplemented).build();
         }
 
         // Forward the request to the path that will handle it
@@ -138,7 +136,7 @@ impl<S> Server<S> {
             let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponseBuilder::new(Status::NotFound, request.version()).build();
+                return HttpResponseBuilder::new(Status::NotFound).build();
             };
             path_state = next_level;
 
@@ -152,7 +150,7 @@ impl<S> Server<S> {
             let Some(next_level) = path_state.next.get(token) else {
                 // Path is not implemented
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponseBuilder::new(Status::NotFound, request.version()).build();
+                return HttpResponseBuilder::new(Status::NotFound).build();
             };
             path_state = next_level;
         }
@@ -165,13 +163,13 @@ impl<S> Server<S> {
             if any_valid_methods(&path_state.handlers) {
                 log_error!("405 Method Not Allowed: {:?} {}", method, path);
                 // RFC 9110 15.5.6: a 405 must list the methods that are allowed
-                let mut response = HttpResponseBuilder::new(Status::MethodNotAllowed, request.version());
+                let mut response = HttpResponseBuilder::new(Status::MethodNotAllowed);
                 response.headers_mut().insert("Allow".to_owned(), allowed_methods(&path_state.handlers));
                 return response.build();
             } else {
                 // We return not found if we are at an intermediate path with no methods defined
                 log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponseBuilder::new(Status::NotFound, request.version()).build();
+                return HttpResponseBuilder::new(Status::NotFound).build();
             }
         };
 
@@ -194,7 +192,7 @@ impl<S> Server<S> {
             Ok(req) => req,
             Err(e) => {
                 log_error!("400 Bad Request: {}", e);
-                return HttpResponseBuilder::new(Status::BadRequest, "HTTP/1.1").build().into_bytes();
+                return HttpResponseBuilder::new(Status::BadRequest).build().into_bytes();
             }
         };
         // A handler returning a response cached in the state comes back as Cow::Borrowed

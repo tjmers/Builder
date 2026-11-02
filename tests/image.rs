@@ -74,9 +74,9 @@ fn image_try_from_file_missing() {
 #[test]
 fn image_served_by_endpoint() {
     let mut s = Server::new(());
-    s.add_endpoint(Method::Get, "/logo", |request: &HttpRequest, _state: &()| -> HttpResponse {
+    s.add_endpoint(Method::Get, "/logo", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         let image = Image::new(PNG_BYTES, ImageType::Png);
-        HttpResponseBuilder::from_image(Status::Ok, image, request.version()).build()
+        HttpResponseBuilder::from_image(Status::Ok, image).build()
     });
 
     let request = HttpRequest::new("GET /logo HTTP/1.1\r\nHost: www.example.com\r\n\r\n").unwrap();
@@ -91,7 +91,7 @@ fn image_served_by_endpoint() {
 #[test]
 fn image_result_error_is_500() {
     let image = Image::try_from("definitely_missing_builder_image.png");
-    let response = HttpResponseBuilder::from_image_result(Status::Ok, image, "HTTP/1.1").build();
+    let response = HttpResponseBuilder::from_image_result(Status::Ok, image).build();
 
     assert_eq!(response.status_code(), 500);
     assert!(response.body().is_empty());

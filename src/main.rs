@@ -8,8 +8,8 @@ fn main() {
   LOGGER.print_to_stdout();
   let mut s = Server::new(());
 
-  s.add_endpoint(Method::Get, "/index", |request: &HttpRequest, _: &()| -> HttpResponse {
-    HttpResponseBuilder::from_text(Status::Ok, "Response", request.version()).build()
+  s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, _: &()| -> HttpResponse {
+    HttpResponseBuilder::from_text(Status::Ok, "Response").build()
   });
 
   s.run(2002);
