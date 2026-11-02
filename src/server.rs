@@ -199,7 +199,11 @@ impl<S> Server<S> {
         self.invoke(&request, &addr).into_bytes()
     }
 
-    pub fn run(&self, port: i32) {
+    // The state is shared by the threads serving each connection, so it must be Sync
+    pub fn run(&self, port: i32)
+    where
+        S: Sync,
+    {
         let mut listener = TcpListener::new(self, Self::handle_raw);
         listener.bind(port);
         listener.run();

@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::io;
+use std::time::Duration;
 
 use crate::ip_address::IpAddress;
 
@@ -37,6 +39,11 @@ pub struct TcpListener<'a, C> {
 
 const RECV_CHUNK_BYTES: usize = 4096;
 
+// A connection that sends nothing for this long is closed
+// Browsers open spare "preconnect" sockets they may never send a request on, so an idle connection is normal
+// and must not tie up the server
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Requests over these limits are dropped
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -68,6 +75,11 @@ fn content_length(headers: &[u8]) -> usize {
 fn recv_chunk(conn: NativeSocket, chunk: &mut [u8], buf: &mut Vec<u8>) -> bool {
     let n = match platform::recv(conn, chunk) {
         Ok(n) => n,
+        // The receive timeout expired (linux reports WouldBlock, Windows TimedOut)
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, buf.len());
+            return false;
+        }
         Err(e) => {
             log_error!("recv: {}", e);
             return false;
@@ -152,5 +164,16 @@ impl<C> TcpListener<'_, C> {
             // The only copy is the one send makes into the kernel's socket buffer
             send_all(conn, &response);
         }
+    }
+
+    // Serves one accepted connection, then closes it
+    // Run on its own thread for each connection, so a client that is slow or never sends a request
+    // (like a browser's preconnect socket) does not block every other client
+    fn serve_connection(&self, conn: NativeSocket, ip: IpAddress) {
+        if let Err(e) = platform::set_recv_timeout(conn, IDLE_TIMEOUT) {
+            log_error!("Failed to set the receive timeout: {}", e);
+        }
+        self.serve(conn, ip);
+        platform::close(conn);
     }
 }

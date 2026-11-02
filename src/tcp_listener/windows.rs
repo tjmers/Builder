@@ -2,10 +2,13 @@ use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 
 use windows_sys::Win32::Networking::WinSock::{
-    accept, bind, closesocket, listen, recv as wsa_recv, send as wsa_send, socket, WSAGetLastError, WSAStartup,
-    AF_INET, INADDR_ANY, INVALID_SOCKET, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR, SOCK_STREAM, WSADATA,
+    accept, bind, closesocket, listen, recv as wsa_recv, send as wsa_send, setsockopt, socket, WSAGetLastError,
+    WSAStartup, AF_INET, INADDR_ANY, INVALID_SOCKET, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET,
+    SO_RCVTIMEO, WSADATA,
 };
 
 use super::{NativeSocket, RawRequestHandler, TcpListener};
@@ -64,6 +67,29 @@ pub(super) fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
+// Makes recv on conn fail with TimedOut once it has waited timeout without receiving anything
+// Windows takes the timeout as a DWORD of milliseconds
+pub(super) fn set_recv_timeout(conn: NativeSocket, timeout: Duration) -> io::Result<()> {
+    let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    let status = unsafe {
+        setsockopt(
+            conn,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &ms as *const u32 as *const u8,
+            mem::size_of::<u32>() as i32,
+        )
+    };
+    if status == SOCKET_ERROR {
+        return Err(last_wsa_error());
+    }
+    Ok(())
+}
+
+pub(super) fn close(conn: NativeSocket) {
+    unsafe { closesocket(conn) };
+}
+
 impl<'a, C> TcpListener<'a, C> {
     pub fn new(context: &'a C, handler: RawRequestHandler<'a, C>) -> Self {
         // Create the socket but do not start listening
@@ -119,7 +145,10 @@ impl<'a, C> TcpListener<'a, C> {
     pub fn valid(&self) -> bool {
         self.socket != INVALID_SOCKET
     }
+}
 
+// C must be Sync because every connection is served on its own thread, all sharing the context
+impl<C: Sync> TcpListener<'_, C> {
     pub fn run(&self) -> bool {
         // Start listening
         if self.socket == INVALID_SOCKET || self.port < 0 {
@@ -132,7 +161,8 @@ impl<'a, C> TcpListener<'a, C> {
         }
         log_info!("Now serving on port {}", self.port);
 
-        loop {
+        // Scoped threads can borrow self (and the context) since they are all joined before run returns
+        thread::scope(|scope| loop {
             let mut client: SOCKADDR_IN = unsafe { mem::zeroed() };
             let mut client_len = mem::size_of::<SOCKADDR_IN>() as i32;
             let conn = unsafe {
@@ -152,10 +182,8 @@ impl<'a, C> TcpListener<'a, C> {
 
             log_info!("Connection from {}:{}", ip, u16::from_be(client.sin_port));
 
-            self.serve(conn, IpAddress::from(ip.octets()));
-
-            unsafe { closesocket(conn) };
-        }
+            scope.spawn(move || self.serve_connection(conn, IpAddress::from(ip.octets())));
+        })
     }
 }
 

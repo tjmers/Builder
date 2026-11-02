@@ -1,6 +1,8 @@
 use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
+use std::thread;
+use std::time::Duration;
 
 use libc::{c_int, c_void, sockaddr, sockaddr_in, socklen_t};
 
@@ -32,6 +34,31 @@ pub(super) fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
         return Err(io::Error::last_os_error());
     }
     Ok(n as usize)
+}
+
+// Makes recv on conn fail with WouldBlock once it has waited timeout without receiving anything
+pub(super) fn set_recv_timeout(conn: NativeSocket, timeout: Duration) -> io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    let status = unsafe {
+        libc::setsockopt(
+            conn,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const c_void,
+            mem::size_of::<libc::timeval>() as socklen_t,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(super) fn close(conn: NativeSocket) {
+    unsafe { libc::close(conn) };
 }
 
 impl<'a, C> TcpListener<'a, C> {
@@ -90,7 +117,10 @@ impl<'a, C> TcpListener<'a, C> {
     pub fn valid(&self) -> bool {
         self.socket >= 0
     }
+}
 
+// C must be Sync because every connection is served on its own thread, all sharing the context
+impl<C: Sync> TcpListener<'_, C> {
     pub fn run(&self) -> bool {
         // Start listening
         if self.socket < 0 || self.port < 0 {
@@ -103,7 +133,8 @@ impl<'a, C> TcpListener<'a, C> {
         }
         log_info!("Now serving on port {}", self.port);
 
-        loop {
+        // Scoped threads can borrow self (and the context) since they are all joined before run returns
+        thread::scope(|scope| loop {
             let mut client: sockaddr_in = unsafe { mem::zeroed() };
             let mut client_len = mem::size_of::<sockaddr_in>() as socklen_t;
             let conn = unsafe {
@@ -123,10 +154,8 @@ impl<'a, C> TcpListener<'a, C> {
 
             log_info!("Connection from {}:{}", ip, u16::from_be(client.sin_port));
 
-            self.serve(conn, IpAddress::from(ip.octets()));
-
-            unsafe { libc::close(conn) };
-        }
+            scope.spawn(move || self.serve_connection(conn, IpAddress::from(ip.octets())));
+        })
     }
 }
 

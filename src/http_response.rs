@@ -194,7 +194,9 @@ impl HttpResponseBuilder {
 
         // Headers: KEY: VALUE
         let mut has_content_length = false;
+        let mut has_connection = false;
         for (key, value) in &self.headers {
+            has_connection |= key.eq_ignore_ascii_case("Connection");
             // Header names are case-insensitive
             if key.eq_ignore_ascii_case("Content-Length") {
                 if !has_body {
@@ -211,6 +213,13 @@ impl HttpResponseBuilder {
 
         if has_body && !has_content_length {
             head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
+
+        // RFC 9112 9.6: the listener closes every connection after one response, so say so
+        // Without it an HTTP/1.1 client assumes keep-alive and may send its next request (e.g. a reload)
+        // on a connection that has already been closed
+        if !has_connection {
+            head.push_str("Connection: close\r\n");
         }
 
         // Blank line separates headers from the body
