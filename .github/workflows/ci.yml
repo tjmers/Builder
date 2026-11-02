@@ -90,3 +90,21 @@ jobs:
       # Step 4: Execute your test cases
       - name: Run Cargo Tests
         run: cargo test --workspace --all-targets
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.os }}
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
