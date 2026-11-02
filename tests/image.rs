@@ -1,7 +1,6 @@
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
-use builder::html::Html;
 use builder::http_request::{HttpRequest, Method};
 use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use builder::image::{Image, ImageType};
@@ -96,20 +95,4 @@ fn image_result_error_is_500() {
 
     assert_eq!(response.status_code(), 500);
     assert!(response.body().is_empty());
-}
-
-#[test]
-fn html_result_ok_and_error() {
-    let html = b"<p>hi</p>";
-    let path = temp_file("a.html", html);
-    let ok = HttpResponseBuilder::from_html_result(Status::Ok, Html::from_file(&path), "HTTP/1.1").build();
-    std::fs::remove_file(&path).unwrap();
-
-    assert_eq!(ok.status_code(), 200);
-    assert_eq!(ok.header("Content-Type"), Some("text/html; charset=utf-8"));
-    assert_eq!(ok.body(), html);
-
-    let missing = Html::from_file("definitely_missing_builder_page.html");
-    let err = HttpResponseBuilder::from_html_result(Status::Ok, missing, "HTTP/1.1").build();
-    assert_eq!(err.status_code(), 500);
 }

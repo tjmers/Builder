@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io;
 
-use crate::html::Html;
 use crate::image::Image;
+use crate::text::TextFile;
 
 pub use crate::data::http_response_status_codes::Status;
 
@@ -126,16 +126,17 @@ impl<'a> HttpResponseBuilder<'a> {
         Self::with_content(status, text.into().into_bytes(), "text/plain; charset=utf-8", version)
     }
 
-    pub fn from_html(status: Status, html: Html, version: &'a str) -> Self {
-        Self::with_content(status, html.into_bytes(), "text/html; charset=utf-8", version)
+    pub fn from_text_file(status: Status, file: TextFile, version: &'a str) -> Self {
+        let content_type = file.content_type();
+        Self::with_content(status, file.into_bytes(), content_type, version)
     }
 
-    // Sends a 500 if the HTML couldn't be loaded
-    pub fn from_html_result(status: Status, html: io::Result<Html>, version: &'a str) -> Self {
-        match html {
-            Ok(html) => Self::from_html(status, html, version),
+    // Sends a 500 if the text file couldn't be loaded
+    pub fn from_text_file_result(status: Status, file: io::Result<TextFile>, version: &'a str) -> Self {
+        match file {
+            Ok(file) => Self::from_text_file(status, file, version),
             Err(e) => {
-                log_error!("500 Internal Server Error: failed to load html: {}", e);
+                log_error!("500 Internal Server Error: failed to load text file: {}", e);
                 Self::new(Status::InternalServerError, version)
             }
         }
