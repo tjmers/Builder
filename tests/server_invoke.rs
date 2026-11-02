@@ -49,9 +49,9 @@ fn get(path: &str) -> String {
 }
 
 // For well formed input that HttpRequest::new must accept
-fn send(server: &Server, raw: &str) -> HttpResponse {
+fn send(server: &Server, raw: &str) -> HttpResponse<'static> {
     let request = HttpRequest::new(raw).expect("HttpRequest::new failed on a well formed request");
-    server.invoke(&request, &addr())
+    server.invoke(&request, &addr()).into_owned()
 }
 
 fn assert_status(server: &Server, raw: &str, expected: Status) {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
 
@@ -181,7 +182,7 @@ impl<'a> HttpResponseBuilder<'a> {
     // Formats the full HTTP response (status line, headers, blank line, body) ready to send
     // Adds a Content-Length header if one wasn't set (and the status allows a body)
     // Consumes self so the head is written into the body's buffer instead of a new allocation
-    pub fn build(self) -> HttpResponse {
+    pub fn build(self) -> HttpResponse<'static> {
         let has_body = allows_body(self.status);
 
         // Status line: VERSION SP CODE SP REASON
@@ -217,22 +218,36 @@ impl<'a> HttpResponseBuilder<'a> {
         }
         // Shifts the body back in place and writes the head in front of it
         response.splice(0..0, head.into_bytes());
-        HttpResponse(response)
+        HttpResponse(Cow::Owned(response))
     }
 }
 
 // A fully built HTTP response, as the bytes sent on the wire
-// Only HttpResponseBuilder::build creates one, so the bytes always hold a status line, headers, and a blank line
+// Only HttpResponseBuilder::build creates one (borrowed copies come from HttpResponse::borrowed),
+// so the bytes always hold a status line, headers, and a blank line
+// The bytes are either owned (built for this request) or borrowed (e.g. a response cached in the server's state)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpResponse(Vec<u8>);
+pub struct HttpResponse<'a>(Cow<'a, [u8]>);
 
-impl HttpResponse {
+impl<'a> HttpResponse<'a> {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
+    // Owned bytes for a freshly built response, borrowed bytes for a cached one
+    pub fn into_bytes(self) -> Cow<'a, [u8]> {
         self.0
+    }
+
+    // A response that borrows this one's bytes instead of copying them
+    // A handler returns state.cached.borrowed() to send a response cached in the server's state
+    pub fn borrowed(&self) -> HttpResponse<'_> {
+        HttpResponse(Cow::Borrowed(&self.0))
+    }
+
+    // Detaches the response from whatever it borrows from, copying the bytes only if they are borrowed
+    pub fn into_owned(self) -> HttpResponse<'static> {
+        HttpResponse(Cow::Owned(self.0.into_owned()))
     }
 
     // The numeric code from the status line: VERSION SP CODE SP REASON
@@ -266,7 +281,12 @@ impl HttpResponse {
     }
 
     // Drops the body but keeps the head, so a HEAD response keeps the GET's Content-Length
+    // A borrowed response is re-sliced, so this never copies
     pub fn strip_body(&mut self) {
-        self.0.truncate(head_len(&self.0));
+        let len = head_len(&self.0);
+        match &mut self.0 {
+            Cow::Borrowed(bytes) => *bytes = &bytes[..len],
+            Cow::Owned(bytes) => bytes.truncate(len),
+        }
     }
 }

@@ -18,26 +18,26 @@ fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
 }
 
 #[test]
-fn image_type_from_extension() {
-    assert_eq!(ImageType::from_extension("png"), Some(ImageType::Png));
-    assert_eq!(ImageType::from_extension("PNG"), Some(ImageType::Png));
-    assert_eq!(ImageType::from_extension("jpg"), Some(ImageType::Jpeg));
-    assert_eq!(ImageType::from_extension("Jpg"), Some(ImageType::Jpeg));
-    assert_eq!(ImageType::from_extension("jpeg"), Some(ImageType::Jpeg));
-    assert_eq!(ImageType::from_extension("gif"), Some(ImageType::Gif));
-    assert_eq!(ImageType::from_extension("webp"), Some(ImageType::Webp));
-    assert_eq!(ImageType::from_extension("avif"), Some(ImageType::Avif));
-    assert_eq!(ImageType::from_extension("svg"), Some(ImageType::Svg));
-    assert_eq!(ImageType::from_extension("ico"), Some(ImageType::Ico));
-    assert_eq!(ImageType::from_extension("bmp"), Some(ImageType::Bmp));
-    assert_eq!(ImageType::from_extension("txt"), None);
-    assert_eq!(ImageType::from_extension(""), None);
+fn image_type_try_from_extension() {
+    assert_eq!(ImageType::try_from("png").ok(), Some(ImageType::Png));
+    assert_eq!(ImageType::try_from("PNG").ok(), Some(ImageType::Png));
+    assert_eq!(ImageType::try_from("jpg").ok(), Some(ImageType::Jpeg));
+    assert_eq!(ImageType::try_from("Jpg").ok(), Some(ImageType::Jpeg));
+    assert_eq!(ImageType::try_from("jpeg").ok(), Some(ImageType::Jpeg));
+    assert_eq!(ImageType::try_from("gif").ok(), Some(ImageType::Gif));
+    assert_eq!(ImageType::try_from("webp").ok(), Some(ImageType::Webp));
+    assert_eq!(ImageType::try_from("avif").ok(), Some(ImageType::Avif));
+    assert_eq!(ImageType::try_from("svg").ok(), Some(ImageType::Svg));
+    assert_eq!(ImageType::try_from("ico").ok(), Some(ImageType::Ico));
+    assert_eq!(ImageType::try_from("bmp").ok(), Some(ImageType::Bmp));
+    assert_eq!(ImageType::try_from("txt").ok(), None);
+    assert_eq!(ImageType::try_from("").ok(), None);
 }
 
 #[test]
-fn image_from_file_png() {
+fn image_try_from_file_png() {
     let path = temp_file("a.png", PNG_BYTES);
-    let image = Image::from_file(&path).unwrap();
+    let image = Image::try_from(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
 
     assert_eq!(image.image_type(), ImageType::Png);
@@ -46,10 +46,10 @@ fn image_from_file_png() {
 }
 
 #[test]
-fn image_from_file_svg() {
+fn image_try_from_file_svg() {
     let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
     let path = temp_file("a.svg", svg);
-    let image = Image::from_file(&path).unwrap();
+    let image = Image::try_from(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
 
     assert_eq!(image.content_type(), "image/svg+xml");
@@ -57,17 +57,17 @@ fn image_from_file_svg() {
 }
 
 #[test]
-fn image_from_file_unsupported_extension() {
-    let err = Image::from_file("not_an_image.txt").err().unwrap();
+fn image_try_from_file_unsupported_extension() {
+    let err = Image::try_from("not_an_image.txt").err().unwrap();
     assert_eq!(err.kind(), ErrorKind::Unsupported);
 
-    let err = Image::from_file("no_extension").err().unwrap();
+    let err = Image::try_from("no_extension").err().unwrap();
     assert_eq!(err.kind(), ErrorKind::Unsupported);
 }
 
 #[test]
-fn image_from_file_missing() {
-    let err = Image::from_file("definitely_missing_builder_image.png").err().unwrap();
+fn image_try_from_file_missing() {
+    let err = Image::try_from("definitely_missing_builder_image.png").err().unwrap();
     assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
@@ -90,7 +90,7 @@ fn image_served_by_endpoint() {
 
 #[test]
 fn image_result_error_is_500() {
-    let image = Image::from_file("definitely_missing_builder_image.png");
+    let image = Image::try_from("definitely_missing_builder_image.png");
     let response = HttpResponseBuilder::from_image_result(Status::Ok, image, "HTTP/1.1").build();
 
     assert_eq!(response.status_code(), 500);

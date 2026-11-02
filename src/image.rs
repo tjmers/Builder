@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // The image formats an Image can be served as
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,23 +14,30 @@ pub enum ImageType {
     Bmp,
 }
 
-impl ImageType {
-    // Matches a file extension (without the dot), ignoring case
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        let ext = ext.to_ascii_lowercase();
-        match ext.as_str() {
-            "png" => Some(ImageType::Png),
-            "jpg" | "jpeg" => Some(ImageType::Jpeg),
-            "gif" => Some(ImageType::Gif),
-            "webp" => Some(ImageType::Webp),
-            "avif" => Some(ImageType::Avif),
-            "svg" => Some(ImageType::Svg),
-            "ico" => Some(ImageType::Ico),
-            "bmp" => Some(ImageType::Bmp),
-            _ => None,
+// Matches a file extension (without the dot), ignoring case
+// Fails with ErrorKind::Unsupported for an unknown extension
+impl TryFrom<&str> for ImageType {
+    type Error = io::Error;
+
+    fn try_from(ext: &str) -> io::Result<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "png" => Ok(ImageType::Png),
+            "jpg" | "jpeg" => Ok(ImageType::Jpeg),
+            "gif" => Ok(ImageType::Gif),
+            "webp" => Ok(ImageType::Webp),
+            "avif" => Ok(ImageType::Avif),
+            "svg" => Ok(ImageType::Svg),
+            "ico" => Ok(ImageType::Ico),
+            "bmp" => Ok(ImageType::Bmp),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported image extension: {}", ext),
+            )),
         }
     }
+}
 
+impl ImageType {
     // The value for the Content-Type header
     pub fn mime(self) -> &'static str {
         match self {
@@ -62,12 +69,11 @@ impl Image {
 
     // The type comes from the file extension
     // Fails with ErrorKind::Unsupported for an unknown extension, before the file is read
-    pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
+    pub fn load(path: &Path) -> io::Result<Self> {
         let image_type = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .and_then(ImageType::from_extension)
+            .and_then(|ext| ImageType::try_from(ext).ok())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -89,5 +95,38 @@ impl Image {
 
     pub fn into_bytes(self) -> Vec<u8> {
         self.data
+    }
+}
+
+// Loading an image from a path reads the file
+impl TryFrom<&Path> for Image {
+    type Error = io::Error;
+
+    fn try_from(path: &Path) -> io::Result<Self> {
+        Image::load(path)
+    }
+}
+
+impl TryFrom<&PathBuf> for Image {
+    type Error = io::Error;
+
+    fn try_from(path: &PathBuf) -> io::Result<Self> {
+        Image::load(path)
+    }
+}
+
+impl TryFrom<PathBuf> for Image {
+    type Error = io::Error;
+
+    fn try_from(path: PathBuf) -> io::Result<Self> {
+        Image::load(&path)
+    }
+}
+
+impl TryFrom<&str> for Image {
+    type Error = io::Error;
+
+    fn try_from(path: &str) -> io::Result<Self> {
+        Image::load(Path::new(path))
     }
 }

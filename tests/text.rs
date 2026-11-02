@@ -15,28 +15,28 @@ fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
 }
 
 #[test]
-fn text_type_from_extension() {
-    assert_eq!(TextType::from_extension("html"), Some(TextType::Html));
-    assert_eq!(TextType::from_extension("HTML"), Some(TextType::Html));
-    assert_eq!(TextType::from_extension("htm"), Some(TextType::Html));
-    assert_eq!(TextType::from_extension("css"), Some(TextType::Css));
-    assert_eq!(TextType::from_extension("js"), Some(TextType::Javascript));
-    assert_eq!(TextType::from_extension("mjs"), Some(TextType::Javascript));
-    assert_eq!(TextType::from_extension("json"), Some(TextType::Json));
-    assert_eq!(TextType::from_extension("xml"), Some(TextType::Xml));
-    assert_eq!(TextType::from_extension("csv"), Some(TextType::Csv));
-    assert_eq!(TextType::from_extension("md"), Some(TextType::Markdown));
-    assert_eq!(TextType::from_extension("markdown"), Some(TextType::Markdown));
-    assert_eq!(TextType::from_extension("txt"), Some(TextType::Plain));
-    assert_eq!(TextType::from_extension("png"), None);
-    assert_eq!(TextType::from_extension(""), None);
+fn text_type_try_from_extension() {
+    assert_eq!(TextType::try_from("html").ok(), Some(TextType::Html));
+    assert_eq!(TextType::try_from("HTML").ok(), Some(TextType::Html));
+    assert_eq!(TextType::try_from("htm").ok(), Some(TextType::Html));
+    assert_eq!(TextType::try_from("css").ok(), Some(TextType::Css));
+    assert_eq!(TextType::try_from("js").ok(), Some(TextType::Javascript));
+    assert_eq!(TextType::try_from("mjs").ok(), Some(TextType::Javascript));
+    assert_eq!(TextType::try_from("json").ok(), Some(TextType::Json));
+    assert_eq!(TextType::try_from("xml").ok(), Some(TextType::Xml));
+    assert_eq!(TextType::try_from("csv").ok(), Some(TextType::Csv));
+    assert_eq!(TextType::try_from("md").ok(), Some(TextType::Markdown));
+    assert_eq!(TextType::try_from("markdown").ok(), Some(TextType::Markdown));
+    assert_eq!(TextType::try_from("txt").ok(), Some(TextType::Plain));
+    assert_eq!(TextType::try_from("png").ok(), None);
+    assert_eq!(TextType::try_from("").ok(), None);
 }
 
 #[test]
-fn text_from_file_css() {
+fn text_try_from_file_css() {
     let css = b"body { color: red; }";
     let path = temp_file("a.css", css);
-    let file = TextFile::from_file(&path).unwrap();
+    let file = TextFile::try_from(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
 
     assert_eq!(file.text_type(), TextType::Css);
@@ -45,10 +45,10 @@ fn text_from_file_css() {
 }
 
 #[test]
-fn text_from_file_javascript() {
+fn text_try_from_file_javascript() {
     let js = b"console.log(\"hi\");";
     let path = temp_file("a.js", js);
-    let file = TextFile::from_file(&path).unwrap();
+    let file = TextFile::try_from(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
 
     assert_eq!(file.text_type(), TextType::Javascript);
@@ -57,17 +57,17 @@ fn text_from_file_javascript() {
 }
 
 #[test]
-fn text_from_file_unsupported_extension() {
-    let err = TextFile::from_file("not_text.png").err().unwrap();
+fn text_try_from_file_unsupported_extension() {
+    let err = TextFile::try_from("not_text.png").err().unwrap();
     assert_eq!(err.kind(), ErrorKind::Unsupported);
 
-    let err = TextFile::from_file("no_extension").err().unwrap();
+    let err = TextFile::try_from("no_extension").err().unwrap();
     assert_eq!(err.kind(), ErrorKind::Unsupported);
 }
 
 #[test]
-fn text_from_file_missing() {
-    let err = TextFile::from_file("definitely_missing_builder_page.html").err().unwrap();
+fn text_try_from_file_missing() {
+    let err = TextFile::try_from("definitely_missing_builder_page.html").err().unwrap();
     assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
@@ -93,14 +93,14 @@ fn text_served_by_endpoint() {
 fn text_result_ok_and_error() {
     let html = b"<p>hi</p>";
     let path = temp_file("a.html", html);
-    let ok = HttpResponseBuilder::from_text_file_result(Status::Ok, TextFile::from_file(&path), "HTTP/1.1").build();
+    let ok = HttpResponseBuilder::from_text_file_result(Status::Ok, TextFile::try_from(&path), "HTTP/1.1").build();
     std::fs::remove_file(&path).unwrap();
 
     assert_eq!(ok.status_code(), 200);
     assert_eq!(ok.header("Content-Type"), Some("text/html; charset=utf-8"));
     assert_eq!(ok.body(), html);
 
-    let missing = TextFile::from_file("definitely_missing_builder_page.html");
+    let missing = TextFile::try_from("definitely_missing_builder_page.html");
     let err = HttpResponseBuilder::from_text_file_result(Status::Ok, missing, "HTTP/1.1").build();
     assert_eq!(err.status_code(), 500);
     assert!(err.body().is_empty());

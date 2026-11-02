@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // The text formats a TextFile can be served as
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,23 +14,30 @@ pub enum TextType {
     Plain,
 }
 
-impl TextType {
-    // Matches a file extension (without the dot), ignoring case
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        let ext = ext.to_ascii_lowercase();
-        match ext.as_str() {
-            "html" | "htm" => Some(TextType::Html),
-            "css" => Some(TextType::Css),
-            "js" | "mjs" => Some(TextType::Javascript),
-            "json" => Some(TextType::Json),
-            "xml" => Some(TextType::Xml),
-            "csv" => Some(TextType::Csv),
-            "md" | "markdown" => Some(TextType::Markdown),
-            "txt" => Some(TextType::Plain),
-            _ => None,
+// Matches a file extension (without the dot), ignoring case
+// Fails with ErrorKind::Unsupported for an unknown extension
+impl TryFrom<&str> for TextType {
+    type Error = io::Error;
+
+    fn try_from(ext: &str) -> io::Result<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "html" | "htm" => Ok(TextType::Html),
+            "css" => Ok(TextType::Css),
+            "js" | "mjs" => Ok(TextType::Javascript),
+            "json" => Ok(TextType::Json),
+            "xml" => Ok(TextType::Xml),
+            "csv" => Ok(TextType::Csv),
+            "md" | "markdown" => Ok(TextType::Markdown),
+            "txt" => Ok(TextType::Plain),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported text file extension: {}", ext),
+            )),
         }
     }
+}
 
+impl TextType {
     // The value for the Content-Type header
     pub fn mime(self) -> &'static str {
         match self {
@@ -62,12 +69,11 @@ impl TextFile {
 
     // The type comes from the file extension
     // Fails with ErrorKind::Unsupported for an unknown extension, before the file is read
-    pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
+    pub fn load(path: &Path) -> io::Result<Self> {
         let text_type = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .and_then(TextType::from_extension)
+            .and_then(|ext| TextType::try_from(ext).ok())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -89,5 +95,38 @@ impl TextFile {
 
     pub fn into_bytes(self) -> Vec<u8> {
         self.data
+    }
+}
+
+// Loading a text file from a path reads the file
+impl TryFrom<&Path> for TextFile {
+    type Error = io::Error;
+
+    fn try_from(path: &Path) -> io::Result<Self> {
+        TextFile::load(path)
+    }
+}
+
+impl TryFrom<&PathBuf> for TextFile {
+    type Error = io::Error;
+
+    fn try_from(path: &PathBuf) -> io::Result<Self> {
+        TextFile::load(path)
+    }
+}
+
+impl TryFrom<PathBuf> for TextFile {
+    type Error = io::Error;
+
+    fn try_from(path: PathBuf) -> io::Result<Self> {
+        TextFile::load(&path)
+    }
+}
+
+impl TryFrom<&str> for TextFile {
+    type Error = io::Error;
+
+    fn try_from(path: &str) -> io::Result<Self> {
+        TextFile::load(Path::new(path))
     }
 }

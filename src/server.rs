@@ -6,7 +6,8 @@ use crate::http_response::{HttpResponse, HttpResponseBuilder, Status};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
 
-pub type RequestHandler<S> = for <'r, 'a> fn(&'r HttpRequest<'a>, &S) -> HttpResponse;
+// The response may borrow from the state, so a handler can return a response cached there without copying it
+pub type RequestHandler<S> = for <'r, 'a, 's> fn(&'r HttpRequest<'a>, &'s S) -> HttpResponse<'s>;
 
 const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
 
@@ -50,6 +51,7 @@ pub struct Server<S = ()> {
     root_lookup: UriLookupTable<S>,
     state: S,
 }
+
 
 
 impl<S> Server<S> {
@@ -106,7 +108,7 @@ impl<S> Server<S> {
         &self,
         request: &HttpRequest<'a>,
         _address: &IpAddress
-        ) -> HttpResponse {
+        ) -> HttpResponse<'_> {
         // The parser only accepts well formed versions, so anything else here is just unsupported
         if !VERSIONS_SUPPORTED.contains(&request.version()) {
             log_error!("505 HTTP Version Not Supported: {:?} for {}", request.version(), request.path());
@@ -192,16 +194,23 @@ impl<S> Server<S> {
             Ok(req) => req,
             Err(e) => {
                 log_error!("400 Bad Request: {}", e);
-                return Cow::Owned(HttpResponseBuilder::new(Status::BadRequest, "HTTP/1.1").build().into_bytes());
+                return HttpResponseBuilder::new(Status::BadRequest, "HTTP/1.1").build().into_bytes();
             }
         };
-        // A cache lookup would go here and return Cow::Borrowed for a hit
-        Cow::Owned(self.invoke(&request, &addr).into_bytes())
+        // A handler returning a response cached in the state comes back as Cow::Borrowed
+        self.invoke(&request, &addr).into_bytes()
     }
 
     pub fn run(&self, port: i32) {
         let mut listener = TcpListener::new(self, Self::handle_raw);
         listener.bind(port);
         listener.run();
+    }
+}
+
+impl Default for Server<()> {
+    // Call self.new with an empty state
+    fn default() -> Self {
+        Self::new(())
     }
 }
