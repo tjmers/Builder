@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 
 use crate::html::Html;
 use crate::image::Image;
@@ -126,11 +127,34 @@ impl<'a> HttpResponseBuilder<'a> {
     }
 
     pub fn from_html(status: Status, html: Html, version: &'a str) -> Self {
-        Self::with_content(status, html.into_string().into_bytes(), "text/html; charset=utf-8", version)
+        Self::with_content(status, html.into_bytes(), "text/html; charset=utf-8", version)
     }
 
-    pub fn from_image(_status: Status, _image: Image, _version: &'a str) -> Self {
-        todo!("Image is not defined yet")
+    // Sends a 500 if the HTML couldn't be loaded
+    pub fn from_html_result(status: Status, html: io::Result<Html>, version: &'a str) -> Self {
+        match html {
+            Ok(html) => Self::from_html(status, html, version),
+            Err(e) => {
+                log_error!("500 Internal Server Error: failed to load html: {}", e);
+                Self::new(Status::InternalServerError, version)
+            }
+        }
+    }
+
+    pub fn from_image(status: Status, image: Image, version: &'a str) -> Self {
+        let content_type = image.content_type();
+        Self::with_content(status, image.into_bytes(), content_type, version)
+    }
+
+    // Sends a 500 if the image couldn't be loaded
+    pub fn from_image_result(status: Status, image: io::Result<Image>, version: &'a str) -> Self {
+        match image {
+            Ok(image) => Self::from_image(status, image, version),
+            Err(e) => {
+                log_error!("500 Internal Server Error: failed to load image: {}", e);
+                Self::new(Status::InternalServerError, version)
+            }
+        }
     }
 
     pub fn status(&self) -> Status {
