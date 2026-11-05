@@ -118,3 +118,50 @@ fn response_says_connection_is_closed() {
     let response = send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.contains("\r\nConnection: close\r\n"), "response: {response:?}");
 }
+
+// Connections are served by a fixed pool of workers, so idle sockets must not each take one up
+// Opening more of them than there are cores would stall the server if they did
+#[test]
+fn more_idle_connections_than_cores_do_not_block_other_requests() {
+    let port = 38107;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    let cores = thread::available_parallelism().map_or(4, |n| n.get());
+    let _idle: Vec<TcpStream> = (0..cores * 4)
+        .map(|_| TcpStream::connect(("127.0.0.1", port as u16)).unwrap())
+        .collect();
+    thread::sleep(Duration::from_millis(50));
+
+    let response = send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
+}
+
+// A connection that never sends a request is eventually closed by the server
+#[test]
+fn idle_connection_is_closed_after_timeout() {
+    let port = 38108;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    let mut idle = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    // The server allows 5 seconds of idleness, checked about once a second
+    idle.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 16];
+    let n = idle.read(&mut buf).expect("server did not close the idle connection");
+    assert_eq!(n, 0, "expected the server to close the connection without a response");
+}
+
+// Workers share the port through SO_REUSEPORT, which must not let a second server quietly join one already running
+#[test]
+fn second_server_cannot_bind_a_port_in_use() {
+    let port = 38109;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    fn handler<'a>(_: &'a (), _: &[u8], _: builder::ip_address::IpAddress) -> std::borrow::Cow<'a, [u8]> {
+        std::borrow::Cow::Borrowed(b"")
+    }
+    let mut second = builder::tcp_listener::TcpListener::new(&(), handler);
+    assert!(!second.bind(port), "a second listener bound a port the server is using");
+}
