@@ -137,6 +137,62 @@ fn more_idle_connections_than_cores_do_not_block_other_requests() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
 }
 
+// A handler that panics must only lose its own connection, since workers serve many at once
+// Panicking on more connections than there are workers would leave nothing to serve the last request if it didn't
+#[test]
+fn panicking_handler_does_not_stop_the_server() {
+    let port = 38110;
+    thread::spawn(move || {
+        let mut s = Server::new(());
+        s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+            HttpResponseBuilder::from_text(Status::Ok, "index").build()
+        });
+        s.add_endpoint(Method::Get, "/panic", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+            panic!("this handler always panics");
+        });
+        s.run(port);
+    });
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    let cores = thread::available_parallelism().map_or(4, |n| n.get());
+    for _ in 0..cores * 4 {
+        let mut stream = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(b"GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        // Closed without a response, either cleanly or with a reset
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        assert!(response.is_empty(), "response: {:?}", String::from_utf8_lossy(&response));
+    }
+
+    let response = send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
+}
+
+// A request too big for one receive and a response too big for the socket's send buffer both take several trips
+// around the event loop, and every byte still has to arrive in order
+#[test]
+fn large_request_and_response_arrive_whole() {
+    let port = 38111;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    let body: String = (0..512 * 1024).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let mut request = format!("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+    request.extend_from_slice(body.as_bytes());
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(&request).unwrap();
+    // Leave the response sitting in the socket buffers for a moment, so the server's send has to wait on the client
+    thread::sleep(Duration::from_millis(100));
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response starts: {:?}", &response[..response.len().min(64)]);
+    let (_, echoed) = response.split_once("\r\n\r\n").expect("response has no end of headers");
+    assert!(echoed == body, "the echoed body differs, {} bytes instead of {}", echoed.len(), body.len());
+}
+
 // A connection that never sends a request is eventually closed by the server
 #[test]
 fn idle_connection_is_closed_after_timeout() {

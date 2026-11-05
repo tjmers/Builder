@@ -10,7 +10,7 @@ Builder requires a 64 bit linux or windows environment
 
 The sockets are specifically implemented via os-specific sockets because they will later be optimized for speed and the os-control is desired.
 
-The shared request framing lives in `src/tcp_listener.rs`, and each platform supplies its own socket calls: `src/tcp_listener/linux.rs` uses libc and `src/tcp_listener/windows.rs` uses Winsock through windows-sys.
+The shared request framing lives in `src/tcp_listener.rs`, and each platform supplies its own socket calls: `src/tcp_listener/linux.rs` uses libc and epoll, and `src/tcp_listener/windows.rs` uses Winsock through windows-sys, with a completion port and `AcceptEx`.
 
 ## Benchmarks
 

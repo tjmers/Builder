@@ -1,6 +1,4 @@
 use std::borrow::Cow;
-#[cfg(windows)]
-use std::io;
 use std::time::Duration;
 
 use crate::ip_address::IpAddress;
@@ -14,14 +12,12 @@ pub type NativeSocket = libc::c_int;
 #[cfg(not(any(windows, target_os = "linux")))]
 compile_error!("OS Not supported");
 
-// Platform implementations of new, bind, valid, run, and drop, plus the raw recv and send calls
+// Platform implementations of new, bind, valid, run, and drop
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
-use windows as platform;
 
 // Takes the listener's context (e.g. the server), the raw request bytes, and the client address,
 // and returns the raw response bytes to send
@@ -36,13 +32,10 @@ pub struct TcpListener<'a, C> {
     port: i32,
 }
 
-#[cfg(windows)]
-const RECV_CHUNK_BYTES: usize = 4096;
-
 // A connection that sends nothing for this long is closed
 // Browsers open spare "preconnect" sockets they may never send a request on, so an idle connection is normal
 // and must not tie up the server
-// On linux idle connections are swept by their worker, so the effective limit is up to a sweep interval longer
+// Idle connections are swept periodically, so the effective limit is up to a sweep interval longer
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Requests over these limits are dropped
@@ -86,7 +79,7 @@ pub(crate) enum Framing {
 }
 
 // Frames one request at the start of buf: the request line and headers, then Content-Length bytes of body
-// Shared by the blocking (Windows) and non-blocking (linux) listeners so both apply the same limits
+// Shared by the Windows and linux listeners so both apply the same limits
 pub(crate) fn request_len(buf: &[u8]) -> Framing {
     let Some(header_len) = header_end(buf) else {
         if buf.len() > MAX_HEADER_BYTES {
@@ -116,101 +109,6 @@ pub(crate) fn log_closed_early(received: usize) {
         log_error!("Connection closed before a request was received");
     } else {
         log_error!("Connection closed after {} bytes, before the full request was received", received);
-    }
-}
-
-// Appends the next chunk received on conn to buf
-// Returns false if the connection closed or errored
-#[cfg(windows)]
-fn recv_chunk(conn: NativeSocket, chunk: &mut [u8], buf: &mut Vec<u8>) -> bool {
-    let n = match platform::recv(conn, chunk) {
-        Ok(n) => n,
-        // The receive timeout expired (Windows reports TimedOut, linux WouldBlock)
-        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-            log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, buf.len());
-            return false;
-        }
-        Err(e) => {
-            log_error!("recv: {}", e);
-            return false;
-        }
-    };
-    if n == 0 {
-        log_closed_early(buf.len());
-        return false;
-    }
-    buf.extend_from_slice(&chunk[..n]);
-    true
-}
-
-// Reads one full request from conn, blocking until it has arrived
-// Returns None if the connection closed or errored first, or if the request is too large
-#[cfg(windows)]
-fn recv_request(conn: NativeSocket) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; RECV_CHUNK_BYTES];
-    loop {
-        match request_len(&buf) {
-            Framing::Complete(total) => {
-                // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
-                buf.truncate(total);
-                return Some(buf);
-            }
-            Framing::TooLarge => return None,
-            Framing::Incomplete => {
-                if !recv_chunk(conn, &mut chunk, &mut buf) {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-// Sends all of data, retrying on partial sends
-#[cfg(windows)]
-fn send_all(conn: NativeSocket, data: &[u8]) -> bool {
-    let mut sent = 0;
-    while sent < data.len() {
-        match platform::send(conn, &data[sent..]) {
-            Ok(n) if n > 0 => sent += n,
-            Ok(_) => {
-                log_error!("send: no bytes were sent");
-                return false;
-            }
-            Err(e) => {
-                log_error!("send: {}", e);
-                return false;
-            }
-        }
-    }
-    true
-}
-
-// The blocking, thread per connection path used on Windows
-#[cfg(windows)]
-impl<C> TcpListener<'_, C> {
-    // Reads one request from an accepted connection and sends back the handler's response
-    // The caller is responsible for closing conn
-    fn serve(&self, conn: NativeSocket, ip: IpAddress) {
-        if let Some(request) = recv_request(conn) {
-            // This is a request -- call the request handler
-            let response = (self.handler)(self.context, &request, ip);
-
-            // Send back the response
-            // The only copy is the one send makes into the kernel's socket buffer
-            send_all(conn, &response);
-        }
-    }
-
-    // Serves one accepted connection, then closes it
-    // Run on its own thread for each connection, so a client that is slow or never sends a request
-    // (like a browser's preconnect socket) does not block every other client
-    fn serve_connection(&self, conn: NativeSocket, ip: IpAddress) {
-        if let Err(e) = platform::set_recv_timeout(conn, IDLE_TIMEOUT) {
-            log_error!("Failed to set the receive timeout: {}", e);
-        }
-        self.serve(conn, ip);
-        platform::close(conn);
     }
 }
 
