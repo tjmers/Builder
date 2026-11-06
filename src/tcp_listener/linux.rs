@@ -5,6 +5,7 @@ use std::mem::{self, MaybeUninit};
 use std::net::Ipv4Addr;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,34 +16,37 @@ use crate::ip_address::IpAddress;
 
 const INVALID_SOCKET: NativeSocket = -1;
 
-// The epoll token for the listening socket; connections use their fd, which is never negative
-const LISTENER_TOKEN: u64 = u64::MAX;
-
-// How many ready sockets one epoll_wait call can return
-const MAX_EVENTS: usize = 64;
+// The fewest threads serving parked connections, however few CPUs there are, so a few slow handlers cannot take up all of them
+const MIN_PARKED_WORKERS: usize = 4;
 
 // How much each recv reads at most, enough for a typical request with a small body in one call
 const RECV_BYTES: usize = 16 * 1024;
 
-// How often a worker with open connections checks them for ones idle past IDLE_TIMEOUT
+// How often parked connections are checked for ones that have gone idle
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+// A connection with a response left to send is closed after this long without the client taking any of it
+// Longer than IDLE_TIMEOUT since a client that pauses partway through a download has not necessarily gone away, but
+// still bounded so a client that stops reading cannot hold on to the response forever
+const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// How long to wait before accepting again when the process is out of file descriptors or memory
+// The connection stays queued and accept fails immediately until something is freed, so retrying straight away would
+// only spin a CPU while the threads that could free something wait for it
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 // How long the kernel holds a new connection back from accept while waiting for its first data (TCP_DEFER_ACCEPT)
 // After this (one SYN-ACK retransmit) it is handed over anyway, so a connection that never sends anything still
 // reaches a worker and is closed after IDLE_TIMEOUT
 const DEFER_ACCEPT_SECS: c_int = 1;
 
-// Responses up to this size are closed without TIME_WAIT (see bind_shared), larger ones get a normal close
+// Responses up to this size are closed without TIME_WAIT (see bind_socket), larger ones get a normal close
 // The fast close resets the connection once the client has acknowledged the whole response, and a client that
 // discards unread data on a reset (Windows does) could lose the end of a large response it is still reading
 const FAST_CLOSE_MAX_BYTES: usize = 64 * 1024;
 
-// How often the rescue thread checks for workers that have stopped making progress (see Worker::rescue)
+// How often the rescue thread checks for workers that have stopped making progress (see Rescue)
 const RESCUE_INTERVAL: Duration = Duration::from_millis(10);
-
-// The longest a blocking accept on a listening socket waits (SO_RCVTIMEO) before giving up with EAGAIN
-// Bounds how long the rescue thread can be stuck if a worker takes the connection it was about to accept
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Logs the last OS error, prefixed by the call that failed
 fn log_os_error(call: &str) {
@@ -93,12 +97,10 @@ fn set_option(socket: NativeSocket, level: c_int, option: c_int, value: c_int) -
     Ok(())
 }
 
-// Binds socket to port on every interface, with SO_REUSEPORT so each worker can bind its own listening socket
-// to the same port
+// Binds socket to port on every interface
 // The TCP options set here are inherited by every connection accepted from the socket
-fn bind_shared(socket: NativeSocket, port: i32) -> io::Result<()> {
+fn bind_socket(socket: NativeSocket, port: i32) -> io::Result<()> {
     set_option(socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-    set_option(socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
     // Only queue a connection for accept once its first data has arrived, so the worker is woken once with the
     // request ready to read, instead of once for the handshake and again (after an EAGAIN and an epoll_ctl) for the request
     set_option(socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, DEFER_ACCEPT_SECS)?;
@@ -130,28 +132,14 @@ fn bind_shared(socket: NativeSocket, port: i32) -> io::Result<()> {
     Ok(())
 }
 
-// Fails if another socket is already listening on port, by binding a plain socket there
-// SO_REUSEADDR lets it past connections lingering in TIME_WAIT, but not past a listener, with or without SO_REUSEPORT
-fn check_port_free(port: i32) -> io::Result<()> {
-    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if socket < 0 {
+// The port socket is bound to, which is the one the OS picked if it was asked for port 0
+fn bound_port(socket: NativeSocket) -> io::Result<i32> {
+    let mut addr: sockaddr_in = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<sockaddr_in>() as socklen_t;
+    if unsafe { libc::getsockname(socket, &mut addr as *mut sockaddr_in as *mut sockaddr, &mut len) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let result = set_option(socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).and_then(|()| {
-        let mut addr: sockaddr_in = unsafe { mem::zeroed() };
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
-        addr.sin_port = (port as u16).to_be();
-        let status = unsafe {
-            libc::bind(socket, &addr as *const sockaddr_in as *const sockaddr, mem::size_of::<sockaddr_in>() as socklen_t)
-        };
-        if status < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    });
-    close(socket);
-    result
+    Ok(u16::from_be(addr.sin_port) as i32)
 }
 
 // Starts listening on a bound socket
@@ -159,28 +147,13 @@ fn start_listening(socket: NativeSocket) -> io::Result<()> {
     if unsafe { libc::listen(socket, libc::SOMAXCONN) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // A new connection starts out acknowledging data straight away, so the kernel would answer the request with an
-    // ACK of its own before the worker had even accepted it, and the response (which carries the same ACK) follows
-    // moments later
-    // Turning quick ACKs off on the listener lets the connections it accepts inherit that, which saves a packet per
-    // connection; the ACK still goes out within the delayed ACK timeout if the handler takes that long
-    // It must come after listen, which resets the setting
-    set_option(socket, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 0)?;
-    // A worker with nothing else to do waits in accept itself, and this bounds that wait (see ACCEPT_TIMEOUT)
-    let timeout = libc::timeval { tv_sec: ACCEPT_TIMEOUT.as_secs() as libc::time_t, tv_usec: 0 };
-    let status = unsafe {
-        libc::setsockopt(
-            socket,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &timeout as *const libc::timeval as *const c_void,
-            mem::size_of::<libc::timeval>() as socklen_t,
-        )
-    };
-    if status < 0 {
-        return Err(io::Error::last_os_error());
-    }
     Ok(())
+}
+
+// Whether a failed accept means the process has run out of something, rather than something being wrong with the
+// one connection it was accepting
+fn out_of_resources(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM))
 }
 
 // Switches socket between blocking and non-blocking
@@ -196,14 +169,16 @@ fn set_nonblocking(socket: NativeSocket, nonblocking: bool) -> io::Result<()> {
     Ok(())
 }
 
-// A listening socket bound to port, sharing it with the others through SO_REUSEPORT
-// It starts out blocking, since its worker waits in accept while it has no other connections
+// A further listening socket on a port the first socket is already listening on, sharing it through SO_REUSEPORT
+// It stays blocking, since its worker waits in accept
 fn open_listener(port: i32) -> io::Result<NativeSocket> {
     let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if socket < 0 {
         return Err(io::Error::last_os_error());
     }
-    let result = bind_shared(socket, port).and_then(|()| start_listening(socket));
+    let result = set_option(socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)
+        .and_then(|()| bind_socket(socket, port))
+        .and_then(|()| start_listening(socket));
     if let Err(e) = result {
         close(socket);
         return Err(e);
@@ -239,7 +214,7 @@ impl Interest {
     }
 }
 
-// A connection owned by one worker, from accept until it is closed
+// A connection from accept until it is closed
 struct Connection<'a> {
     ip: IpAddress,
     // The request received so far
@@ -306,7 +281,7 @@ impl<'a> Connection<'a> {
     }
 
     // Stores the response to send
-    // A large response gets a normal close with TIME_WAIT instead of the fast close set up in bind_shared
+    // A large response gets a normal close with TIME_WAIT instead of the fast close set up in bind_socket
     fn set_response(&mut self, fd: NativeSocket, response: Cow<'a, [u8]>) {
         if response.len() > FAST_CLOSE_MAX_BYTES {
             // 0 means the system default
@@ -343,12 +318,18 @@ impl<'a> Connection<'a> {
         }
         Ok(true)
     }
+
+    // Whether it has gone too long without progress, allowing longer for a client to take a response than to send a request
+    fn is_idle(&self) -> bool {
+        let timeout = if self.response.is_some() { SEND_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
+        self.last_active.elapsed() >= timeout
+    }
 }
 
 impl<'a, C> TcpListener<'a, C> {
     pub fn new(context: &'a C, handler: RawRequestHandler<'a, C>) -> Self {
         // Create the socket but do not start listening
-        // It starts out blocking, since its worker waits in accept while it has no other connections
+        // It stays blocking, since its worker waits in accept
         let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if socket < 0 {
             log_os_error("socket");
@@ -366,30 +347,28 @@ impl<'a, C> TcpListener<'a, C> {
         if self.socket < 0 {
             return false;
         }
-        // SO_REUSEPORT would let this join another server already listening on the port and silently split its
-        // connections, so first make sure nothing is
-        if let Err(e) = check_port_free(port) {
-            log_error!("bind: port {} is unavailable: {}", port, e);
-            unsafe { libc::close(self.socket) };
-            self.socket = INVALID_SOCKET;
-            return false;
+        // This socket has no SO_REUSEPORT yet (see run), so it cannot join a server already listening on the port
+        let bound = bind_socket(self.socket, port).and_then(|()| bound_port(self.socket));
+        match bound {
+            Ok(port) => {
+                self.port = port;
+                true
+            }
+            Err(e) => {
+                log_error!("bind: {}", e);
+                unsafe { libc::close(self.socket) };
+                self.socket = INVALID_SOCKET;
+                false
+            }
         }
-        if let Err(e) = bind_shared(self.socket, port) {
-            log_error!("bind: {}", e);
-            unsafe { libc::close(self.socket) };
-            self.socket = INVALID_SOCKET;
-            return false;
-        }
-        self.port = port;
-        true
     }
 
     pub fn valid(&self) -> bool {
         self.socket >= 0
     }
 
-    // Accepts one pending connection from a listening socket, if there is one
-    fn accept(&self, listen_socket: NativeSocket) -> Option<(NativeSocket, IpAddress)> {
+    // Accepts one connection from a listening socket, waiting for one if the socket is blocking
+    fn accept(&self, listen_socket: NativeSocket) -> io::Result<(NativeSocket, IpAddress)> {
         let mut client: sockaddr_in = unsafe { mem::zeroed() };
         let mut client_len = mem::size_of::<sockaddr_in>() as socklen_t;
         let conn = unsafe {
@@ -401,18 +380,12 @@ impl<'a, C> TcpListener<'a, C> {
             )
         };
         if conn < 0 {
-            let e = io::Error::last_os_error();
-            // WouldBlock is also a blocking accept reaching ACCEPT_TIMEOUT, and Interrupted a signal during one
-            if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
-                // If there is an error here do not shut down the server just continue
-                log_error!("accept: {}", e);
-            }
-            return None;
+            return Err(io::Error::last_os_error());
         }
 
         let ip = Ipv4Addr::from(u32::from_be(client.sin_addr.s_addr));
         log_info!("Connection from {}:{}", ip, u16::from_be(client.sin_port));
-        Some((conn, IpAddress::from(ip.octets())))
+        Ok((conn, IpAddress::from(ip.octets())))
     }
 
     // Moves a connection along as far as it can go without blocking: receive the request, run the handler, send
@@ -477,22 +450,6 @@ fn pin_to_cpu(cpu: usize) -> io::Result<()> {
     Ok(())
 }
 
-// Runs the calling thread under SCHED_IDLE, so it only gets its CPU when no ordinary thread wants it
-// A worker serves the connections from clients on its own CPU, and closing a connection wakes the client blocked
-// reading the response
-// While the worker holds the CPU the scheduler counts it as busy and moves the woken client to another, often idle,
-// CPU, which costs a cross-CPU interrupt (expensive in a VM) and takes the client's next connection along with it
-// A CPU running only SCHED_IDLE threads counts as free, so the client is woken right where it was and runs straight
-// away, and the worker carries on once the client blocks again
-// An unprivileged thread cannot switch back to a normal policy, which is why the rescue thread exists
-fn deprioritize_worker() -> io::Result<()> {
-    let param = libc::sched_param { sched_priority: 0 };
-    if unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 // Has the kernel hand this listening socket the connections whose packets are processed on cpu
 // The worker pinned to that CPU then serves the connection on the same core as the network stack (and, for a local
 // client, as the client itself), so waking each other needs no cross-CPU interrupt and the socket stays in that
@@ -508,164 +465,201 @@ fn steer_to_cpu(_socket: NativeSocket, _cpu: usize) -> io::Result<()> {
     Ok(())
 }
 
-// Counts a worker's trips around its event loop, so the rescue thread can tell when it has stalled
+// What the threads share
+// A connection normally goes from accept to close on its CPU's worker without touching any of this
+// Only one that has to wait on its socket is parked here, where any parked worker can pick it up, so a slow handler
+// never holds up a connection other than its own
+struct Shared<'l, 'a, C> {
+    listener: &'l TcpListener<'a, C>,
+    // Wakes the parked workers when a parked connection's socket is ready
+    epoll: c_int,
+    // The connections waiting on their sockets
+    // One being driven is taken out, so it belongs to one thread at a time and the idle sweep cannot close it
+    parked: Mutex<HashMap<NativeSocket, Connection<'a>>>,
+}
+
+impl<'a, C> Shared<'_, 'a, C> {
+    fn parked(&self) -> MutexGuard<'_, HashMap<NativeSocket, Connection<'a>>> {
+        // Nothing panics while holding the lock, and the map is valid even if something did
+        self.parked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // Parks conn until its socket is ready for interest
+    fn park(&self, fd: NativeSocket, mut conn: Connection<'a>, interest: Interest) {
+        let op = if conn.interest == Interest::None { libc::EPOLL_CTL_ADD } else { libc::EPOLL_CTL_MOD };
+        conn.interest = interest;
+
+        // A parked worker can have the event before epoll_ctl even returns, so the connection goes in the map first
+        // Holding the lock across both stops the sweep closing this fd in between, so epoll_ctl cannot reach a new
+        // connection that was given the same fd
+        // EPOLLONESHOT has epoll report it once and then wait to be armed again here, so one thread has it at a time
+        let mut parked = self.parked();
+        parked.insert(fd, conn);
+        let events = interest.events() | libc::EPOLLONESHOT as u32;
+        if let Err(e) = epoll_ctl(self.epoll, op, fd, events, fd as u64) {
+            log_error!("epoll_ctl: {}", e);
+            parked.remove(&fd);
+            close(fd);
+        }
+    }
+
+    // Closes parked connections that have gone too long without making progress
+    // Browsers open spare "preconnect" sockets they may never send a request on, so these are expected
+    fn close_idle(&self) {
+        self.parked().retain(|&fd, conn| {
+            if !conn.is_idle() {
+                return true;
+            }
+            match &conn.response {
+                Some((response, sent)) => {
+                    log_info!("Closing connection that stopped reading after {} of {} bytes", sent, response.len());
+                }
+                None => log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, conn.request.len()),
+            }
+            // Closing also removes it from epoll
+            close(fd);
+            false
+        });
+    }
+}
+
+impl<C> Drop for Shared<'_, '_, C> {
+    fn drop(&mut self) {
+        for &fd in self.parked().keys() {
+            close(fd);
+        }
+        unsafe { libc::close(self.epoll) };
+    }
+}
+
+// Counts how many times a worker has come back from accept, so the rescue thread can tell when it has stalled
 // Aligned to a cache line so workers bumping their own counters never contend
 #[repr(align(64))]
 #[derive(Default)]
 struct Progress(AtomicU64);
 
-// A listening socket the rescue thread watches, with its worker's progress at the last check
+impl Progress {
+    fn bump(&self) {
+        self.0.store(self.0.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    }
+}
+
+// One worker thread, with a finished connection's receive buffer so most connections do not allocate one
+struct Worker<'s, 'l, 'a, C> {
+    shared: &'s Shared<'l, 'a, C>,
+    spare: Vec<u8>,
+}
+
+impl<'a, C> Worker<'_, '_, 'a, C> {
+    // Accepts connections from this worker's own socket and serves each one straight away
+    // TCP_DEFER_ACCEPT means the request has usually already arrived, so most connections are accept, recv, send, close
+    // Waiting in a blocking accept rather than in epoll saves a syscall per connection
+    fn accept_connections(&mut self, socket: NativeSocket, progress: &Progress) {
+        // Whether the last accept ran out of resources, so a shortage is logged once instead of on every retry
+        let mut short = false;
+        loop {
+            let accepted = self.shared.listener.accept(socket);
+            progress.bump();
+            match accepted {
+                Ok((fd, ip)) => {
+                    short = false;
+                    let conn = Connection::new(ip, mem::take(&mut self.spare));
+                    self.advance(fd, conn);
+                }
+                Err(e) if out_of_resources(&e) => {
+                    if !short {
+                        log_error!("accept: {}, retrying until something is freed", e);
+                        short = true;
+                    }
+                    thread::sleep(ACCEPT_BACKOFF);
+                }
+                // WouldBlock is the rescue thread having the socket non-blocking for a moment (see Rescue::take_over)
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                // If there is an error here do not shut down the server just continue
+                Err(e) => log_error!("accept: {}", e),
+            }
+        }
+    }
+
+    // Serves parked connections as their sockets become ready, one at a time
+    // Taking several events at once would leave the rest waiting behind this thread's handler while others sit idle
+    fn serve_parked(&mut self) {
+        let mut event = epoll_event { events: 0, u64: 0 };
+        loop {
+            let n = unsafe { libc::epoll_wait(self.shared.epoll, &mut event, 1, -1) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Nothing that fails here can recover, and carrying on would only spin
+                log_error!("epoll_wait: {}", e);
+                return;
+            }
+            if n == 0 {
+                continue;
+            }
+            // The sweep can close a connection after its event was returned, which leaves nothing to take here
+            // If its fd was reused meanwhile this takes the new connection, which finds nothing to do and parks again
+            let fd = event.u64 as NativeSocket;
+            let conn = self.shared.parked().remove(&fd);
+            if let Some(conn) = conn {
+                self.advance(fd, conn);
+            }
+        }
+    }
+
+    // Drives conn and then either closes it or parks it until its socket is ready for what it is waiting on
+    fn advance(&mut self, fd: NativeSocket, mut conn: Connection<'a>) {
+        match self.shared.listener.drive(fd, &mut conn) {
+            Next::Close => {
+                close(fd);
+                if self.spare.capacity() == 0 && conn.request.capacity() <= RECV_BYTES {
+                    conn.request.clear();
+                    self.spare = conn.request;
+                }
+            }
+            Next::Wait(interest) => self.shared.park(fd, conn, interest),
+        }
+    }
+}
+
+// A worker's listening socket, with the worker's progress at the last check
 struct Watched<'p> {
     socket: NativeSocket,
     progress: &'p Progress,
     seen: u64,
 }
 
-// One thread's event loop state: its epoll instance and the connections it has accepted
-// Workers each accept from their own listening socket, while the rescue thread has none and only takes over
-// connections waiting on a stalled worker's socket
-struct Worker<'l, 'a, 'p, C> {
-    listener: &'l TcpListener<'a, C>,
-    // This worker's own listening socket, or INVALID_SOCKET for the rescue thread
-    listen_socket: NativeSocket,
-    // The first worker uses the listener's socket, which the listener closes
-    owns_listen_socket: bool,
-    epoll: c_int,
-    connections: HashMap<NativeSocket, Connection<'a>>,
-    // Bumped every trip around the event loop, None for the rescue thread
-    progress: Option<&'p Progress>,
-    // The workers' listening sockets, only for the rescue thread
+// Takes over the connections queued on a worker's listening socket while that worker makes no progress, which is a
+// long handler or a CPU busy with something else
+// It hands them to the parked workers and never runs a handler itself, so nothing can hold it up, and those
+// connections wait at most about twice RESCUE_INTERVAL
+struct Rescue<'s, 'l, 'a, 'p, C> {
+    shared: &'s Shared<'l, 'a, C>,
     watched: Vec<Watched<'p>>,
-    // Whether listen_socket is non-blocking and registered with epoll, which it only is while there are connections
-    listener_in_epoll: bool,
-    // A finished connection's receive buffer, reused for the next one so most connections do not allocate one
-    spare: Vec<u8>,
+    // Whether the last accept ran out of resources, so a shortage is logged once instead of on every retry
+    short: bool,
+    // When to try again after running out of resources
+    paused_until: Instant,
 }
 
-impl<'l, 'a, 'p, C> Worker<'l, 'a, 'p, C> {
-    fn new(listener: &'l TcpListener<'a, C>, listen_socket: NativeSocket, owns_listen_socket: bool) -> Option<Self> {
-        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if epoll < 0 {
-            log_os_error("epoll_create1");
-            return None;
-        }
-        Some(Worker {
-            listener,
-            listen_socket,
-            owns_listen_socket,
-            epoll,
-            connections: HashMap::new(),
-            progress: None,
-            watched: Vec::new(),
-            listener_in_epoll: false,
-            spare: Vec::new(),
-        })
-    }
-
-    fn is_rescue(&self) -> bool {
-        self.listen_socket == INVALID_SOCKET
-    }
-
-    fn bump_progress(&self) {
-        if let Some(progress) = self.progress {
-            progress.0.store(progress.0.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
-        }
-    }
-
-    // Moves the listening socket between waiting in a blocking accept (no connections open) and waiting in epoll
-    // alongside the open connections
-    // A blocking accept is one syscall per connection instead of epoll_wait and then accept, and connections are
-    // usually served and closed straight from accept, so the switch to epoll is rare
-    fn set_listener_in_epoll(&mut self, in_epoll: bool) -> io::Result<()> {
-        if in_epoll == self.listener_in_epoll {
-            return Ok(());
-        }
-        if in_epoll {
-            set_nonblocking(self.listen_socket, true)?;
-            epoll_ctl(self.epoll, libc::EPOLL_CTL_ADD, self.listen_socket, libc::EPOLLIN as u32, LISTENER_TOKEN)?;
-        } else {
-            epoll_ctl(self.epoll, libc::EPOLL_CTL_DEL, self.listen_socket, 0, LISTENER_TOKEN)?;
-            set_nonblocking(self.listen_socket, false)?;
-        }
-        self.listener_in_epoll = in_epoll;
-        Ok(())
-    }
-
-    fn new_connection(&mut self, ip: IpAddress) -> Connection<'a> {
-        Connection::new(ip, mem::take(&mut self.spare))
-    }
-
-    fn run(&mut self) {
-        let mut events = [epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
+impl<C> Rescue<'_, '_, '_, '_, C> {
+    fn run(&mut self) -> ! {
         let mut last_sweep = Instant::now();
-        let mut last_rescue = Instant::now();
         loop {
-            if !self.is_rescue() {
-                let in_epoll = !self.connections.is_empty();
-                if let Err(e) = self.set_listener_in_epoll(in_epoll) {
-                    // Stay in whichever mode the socket is still in
-                    log_error!("Failed to switch the listener {} epoll: {}", if in_epoll { "into" } else { "out of" }, e);
-                }
-                if !self.listener_in_epoll {
-                    // With no connections open there is nothing to time out, so just wait for the next one
-                    let accepted = self.listener.accept(self.listen_socket);
-                    self.bump_progress();
-                    if let Some((fd, ip)) = accepted {
-                        let conn = self.new_connection(ip);
-                        self.advance(fd, conn);
-                    }
-                    continue;
-                }
+            thread::sleep(RESCUE_INTERVAL);
+            if Instant::now() >= self.paused_until {
+                self.check_workers();
             }
-            let timeout = if self.is_rescue() {
-                RESCUE_INTERVAL.as_millis() as c_int
-            } else {
-                SWEEP_INTERVAL.as_millis() as c_int
-            };
-            let n = unsafe { libc::epoll_wait(self.epoll, events.as_mut_ptr(), MAX_EVENTS as c_int, timeout) };
-            self.bump_progress();
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    log_error!("epoll_wait: {}", e);
-                }
-                continue;
-            }
-
-            for event in &events[..n as usize] {
-                if event.u64 == LISTENER_TOKEN {
-                    if let Some((fd, ip)) = self.listener.accept(self.listen_socket) {
-                        // The request has usually already arrived (TCP_DEFER_ACCEPT), so try serving it before
-                        // involving epoll at all
-                        let conn = self.new_connection(ip);
-                        self.advance(fd, conn);
-                    }
-                } else {
-                    let fd = event.u64 as NativeSocket;
-                    if let Some(conn) = self.connections.remove(&fd) {
-                        self.advance(fd, conn);
-                    }
-                }
-            }
-
-            if self.is_rescue() && last_rescue.elapsed() >= RESCUE_INTERVAL {
-                self.rescue();
-                last_rescue = Instant::now();
-            }
-
-            if !self.connections.is_empty() && last_sweep.elapsed() >= SWEEP_INTERVAL {
-                self.close_idle();
+            if last_sweep.elapsed() >= SWEEP_INTERVAL {
+                self.shared.close_idle();
                 last_sweep = Instant::now();
             }
         }
     }
 
-    // Serves the connections waiting on any worker's listening socket while that worker has made no progress since
-    // the last check
-    // Workers run under SCHED_IDLE, so one sharing its CPU with a busy unrelated thread barely runs, and a handler
-    // that takes a long time also holds up everything queued behind it
-    // This thread has a normal priority and no fixed CPU, so those connections wait at most about RESCUE_INTERVAL
-    fn rescue(&mut self) {
+    fn check_workers(&mut self) {
         let mut ready: Vec<libc::pollfd> = self.watched.iter().map(|w| libc::pollfd { fd: w.socket, events: libc::POLLIN, revents: 0 }).collect();
         let polled = unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, 0) };
         if polled < 0 {
@@ -678,69 +672,43 @@ impl<'l, 'a, 'p, C> Worker<'l, 'a, 'p, C> {
             watched.seen = progress;
             if polled > 0 && stalled && poll.revents & libc::POLLIN != 0 {
                 let socket = watched.socket;
-                // The socket may be blocking (see set_listener_in_epoll), so check there is still a connection
-                // waiting before each accept, and a worker that wakes and takes it first leaves this waiting at
-                // most ACCEPT_TIMEOUT
-                while let Some((fd, ip)) = self.listener.accept(socket) {
-                    let conn = self.new_connection(ip);
-                    self.advance(fd, conn);
-                    let mut again = libc::pollfd { fd: socket, events: libc::POLLIN, revents: 0 };
-                    if unsafe { libc::poll(&mut again, 1, 0) } <= 0 || again.revents & libc::POLLIN == 0 {
-                        break;
+                self.take_over(socket);
+            }
+        }
+    }
+
+    // Moves every connection queued on socket to the parked workers
+    // The socket is non-blocking only for this, so this cannot get stuck if its worker wakes and takes them first
+    // A worker already waiting in accept stays waiting, and one arriving meanwhile just tries again
+    fn take_over(&mut self, socket: NativeSocket) {
+        if let Err(e) = set_nonblocking(socket, true) {
+            log_error!("Failed to make a stalled worker's socket non-blocking: {}", e);
+            return;
+        }
+        loop {
+            match self.shared.listener.accept(socket) {
+                Ok((fd, ip)) => {
+                    self.short = false;
+                    self.shared.park(fd, Connection::new(ip, Vec::new()), Interest::Read);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    if !out_of_resources(&e) {
+                        log_error!("accept: {}", e);
+                    } else {
+                        if !self.short {
+                            log_error!("accept: {}, retrying until something is freed", e);
+                            self.short = true;
+                        }
+                        self.paused_until = Instant::now() + ACCEPT_BACKOFF;
                     }
+                    break;
                 }
             }
         }
-    }
-
-    // Drives conn and then either closes it or keeps it, registered for what it is now waiting on
-    fn advance(&mut self, fd: NativeSocket, mut conn: Connection<'a>) {
-        let interest = match self.listener.drive(fd, &mut conn) {
-            Next::Close => {
-                // Closing also removes it from epoll
-                close(fd);
-                if self.spare.capacity() == 0 && conn.request.capacity() <= RECV_BYTES {
-                    conn.request.clear();
-                    self.spare = conn.request;
-                }
-                return;
-            }
-            Next::Wait(interest) => interest,
-        };
-        if interest != conn.interest {
-            let op = if conn.interest == Interest::None { libc::EPOLL_CTL_ADD } else { libc::EPOLL_CTL_MOD };
-            if let Err(e) = epoll_ctl(self.epoll, op, fd, interest.events(), fd as u64) {
-                log_error!("epoll_ctl: {}", e);
-                close(fd);
-                return;
-            }
-            conn.interest = interest;
-        }
-        self.connections.insert(fd, conn);
-    }
-
-    // Closes connections that have gone IDLE_TIMEOUT without making progress
-    // Browsers open spare "preconnect" sockets they may never send a request on, so these are expected
-    fn close_idle(&mut self) {
-        self.connections.retain(|&fd, conn| {
-            let keep = conn.last_active.elapsed() < IDLE_TIMEOUT;
-            if !keep {
-                log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, conn.request.len());
-                close(fd);
-            }
-            keep
-        });
-    }
-}
-
-impl<C> Drop for Worker<'_, '_, '_, C> {
-    fn drop(&mut self) {
-        for &fd in self.connections.keys() {
-            close(fd);
-        }
-        unsafe { libc::close(self.epoll) };
-        if self.owns_listen_socket {
-            close(self.listen_socket);
+        if let Err(e) = set_nonblocking(socket, false) {
+            log_error!("Failed to make a worker's socket blocking again: {}", e);
         }
     }
 }
@@ -752,24 +720,38 @@ impl<C: Sync> TcpListener<'_, C> {
         if self.socket < 0 || self.port < 0 {
             return false;
         }
+        // Without SO_REUSEPORT at this point, this fails if another socket is already listening on the port, even one
+        // that was bound at the same time as this one, so two servers can never end up sharing the port
         if let Err(e) = start_listening(self.socket) {
             log_error!("listen: {}", e);
             return false;
         }
+        // Now that this server has the port, let its workers' sockets join this one
+        if let Err(e) = set_option(self.socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1) {
+            log_error!("Failed to share the port between workers: {}", e);
+            return false;
+        }
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll < 0 {
+            log_os_error("epoll_create1");
+            return false;
+        }
         log_info!("Now serving on port {}", self.port);
 
-        // A fixed pool of workers, one per core, each multiplexing many connections with its own epoll instance
-        // Spawning a thread for every connection cost more than serving the request, and a connection that is slow
-        // or never sends anything (like a browser's preconnect socket) only takes up a map entry, not a thread
+        let shared = Shared { listener: self, epoll, parked: Mutex::new(HashMap::new()) };
+        let shared = &shared;
+
+        // A fixed pool of workers, one per core, since spawning a thread for every connection cost more than serving
+        // the request
         // Each worker gets its own listening socket on the port, and the kernel spreads new connections across them,
         // so workers never contend over one accept queue
         let mut sockets = Vec::new();
         for (i, cpu) in worker_cpus().into_iter().enumerate() {
-            let (listen_socket, owned) = if i == 0 {
-                (self.socket, false)
+            let listen_socket = if i == 0 {
+                self.socket
             } else {
                 match open_listener(self.port) {
-                    Ok(socket) => (socket, true),
+                    Ok(socket) => socket,
                     Err(e) => {
                         log_error!("Failed to open a listening socket for worker {}: {}", i, e);
                         continue;
@@ -781,43 +763,38 @@ impl<C: Sync> TcpListener<'_, C> {
                     log_error!("Failed to steer connections on CPU {} to its worker: {}", cpu, e);
                 }
             }
-            sockets.push((listen_socket, owned, cpu));
+            sockets.push((listen_socket, cpu));
         }
         let progress: Vec<Progress> = sockets.iter().map(|_| Progress::default()).collect();
+        // A connection that is slow or never sends anything (like a browser's preconnect socket) only takes up a map
+        // entry here, not a thread
+        // These are not pinned, so one is free to run wherever there is room
+        let parked_workers = sockets.len().max(MIN_PARKED_WORKERS);
 
         // Scoped threads can borrow self (and the context) since they are all joined before run returns
         thread::scope(|scope| {
-            for (&(listen_socket, owned, cpu), progress) in sockets.iter().zip(&progress) {
+            for (&(listen_socket, cpu), progress) in sockets.iter().zip(&progress) {
                 scope.spawn(move || {
                     if let Some(cpu) = cpu {
                         if let Err(e) = pin_to_cpu(cpu) {
                             log_error!("Failed to pin the worker for CPU {}: {}", cpu, e);
-                        } else if let Err(e) = deprioritize_worker() {
-                            // Only pinned workers benefit, since the point is keeping the client on the worker's CPU
-                            log_error!("Failed to run the worker for CPU {} under SCHED_IDLE: {}", cpu, e);
                         }
                     }
-                    if let Some(mut worker) = Worker::new(self, listen_socket, owned) {
-                        worker.progress = Some(progress);
-                        worker.run();
-                    } else if owned {
-                        close(listen_socket);
-                    }
+                    Worker { shared, spare: Vec::new() }.accept_connections(listen_socket, progress);
                 });
             }
-
-            // The calling thread becomes the rescue thread, at its own (normal) priority
-            if let Some(mut rescue) = Worker::new(self, INVALID_SOCKET, false) {
-                rescue.watched = sockets
-                    .iter()
-                    .zip(&progress)
-                    .map(|(&(socket, _, _), progress)| Watched { socket, progress, seen: 0 })
-                    .collect();
-                rescue.run();
+            for _ in 0..parked_workers {
+                scope.spawn(move || Worker { shared, spare: Vec::new() }.serve_parked());
             }
-        });
-        // The workers only return if they could not start
-        false
+
+            // The calling thread takes over from stalled workers and sweeps for idle connections
+            let watched = sockets
+                .iter()
+                .zip(&progress)
+                .map(|(&(socket, _), progress)| Watched { socket, progress, seen: 0 })
+                .collect();
+            Rescue { shared, watched, short: false, paused_until: Instant::now() }.run()
+        })
     }
 }
 

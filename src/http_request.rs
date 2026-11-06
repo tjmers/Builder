@@ -256,40 +256,55 @@ fn parse_target(target: &str) -> Result<Cow<'_, str>, ParseError> {
     }
 }
 
+// Why a chunked body could not be read to its end
+pub(crate) enum ChunkError {
+    // It is fine so far, but more bytes are needed
+    Incomplete,
+    Malformed,
+}
+
 // RFC 9112 7.1: chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF, ending with a 0 size chunk and trailers
-fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, ParseError> {
-    fn line<'a>(body: &mut &'a [u8]) -> Result<&'a [u8], ParseError> {
-        next_line_bytes(body).map_err(|_| ParseError::InvalidChunkedBody)
+// Passes each chunk's data to on_chunk and returns how many bytes the whole body takes up, including the framing
+// Framing a request and decoding it both go through here, so they cannot disagree about where a body ends
+pub(crate) fn walk_chunks<'a>(mut body: &'a [u8], mut on_chunk: impl FnMut(&'a [u8])) -> Result<usize, ChunkError> {
+    fn line<'a>(body: &mut &'a [u8]) -> Result<&'a [u8], ChunkError> {
+        next_line_bytes(body).map_err(|_| ChunkError::Incomplete)
     }
-    let mut decoded = Vec::new();
+    let start = body.len();
 
     loop {
         // Chunk extensions after ';' are ignored
         let size_line = line(&mut body)?;
         let size = trim_bytes(size_line.split(|&b| b == b';').next().unwrap_or_default());
         if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
-            return Err(ParseError::InvalidChunkedBody);
+            return Err(ChunkError::Malformed);
         }
         let size = std::str::from_utf8(size)
             .ok()
             .and_then(|size| usize::from_str_radix(size, 16).ok())
-            .ok_or(ParseError::InvalidChunkedBody)?;
+            .ok_or(ChunkError::Malformed)?;
         if size == 0 {
             break;
         }
 
-        let data = body.get(..size).ok_or(ParseError::InvalidChunkedBody)?;
-        decoded.extend_from_slice(data);
+        let data = body.get(..size).ok_or(ChunkError::Incomplete)?;
+        on_chunk(data);
         body = &body[size..];
 
         if !line(&mut body)?.is_empty() {
-            return Err(ParseError::InvalidChunkedBody);
+            return Err(ChunkError::Malformed);
         }
     }
 
     // Trailer fields are ignored, up to the terminating empty line
     while !line(&mut body)?.is_empty() {}
 
+    Ok(start - body.len())
+}
+
+fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, ParseError> {
+    let mut decoded = Vec::new();
+    walk_chunks(body, |data| decoded.extend_from_slice(data)).map_err(|_| ParseError::InvalidChunkedBody)?;
     Ok(decoded)
 }
 
@@ -394,29 +409,29 @@ impl<'a> Head<'a> {
     }
 
     // RFC 9112 6.3: determines the body from Transfer-Encoding or Content-Length
-    // Returns the body's raw bytes, or its content when it had to be decoded
-    fn body<'b>(&self, rest: &'b [u8]) -> Result<Result<&'b [u8], String>, ParseError> {
+    // Borrowed from rest unless it had to be decoded
+    fn body<'b>(&self, rest: &'b [u8]) -> Result<Cow<'b, [u8]>, ParseError> {
         if let Some(encoding) = self.transfer_encoding {
             // Unsupported codings are left for the server to answer with 501
             if !encoding.eq_ignore_ascii_case("chunked") {
-                return Ok(Ok(b""));
+                return Ok(Cow::Borrowed(b""));
             }
-            return decode_chunked(rest).map(|decoded| Err(to_text(&decoded).into_owned()));
+            return decode_chunked(rest).map(Cow::Owned);
         }
         match self.content_length {
             Some(length) if rest.len() < length => Err(ParseError::IncompleteBody),
-            Some(length) => Ok(Ok(&rest[..length])),
-            None => Ok(Ok(b"")),
+            Some(length) => Ok(Cow::Borrowed(&rest[..length])),
+            None => Ok(Cow::Borrowed(b"")),
         }
     }
 
-    fn into_request(self, body: &'a [u8], content: OnceLock<Cow<'a, str>>) -> HttpRequest<'a> {
+    fn into_request(self, body: Cow<'a, [u8]>) -> HttpRequest<'a> {
         HttpRequest {
             method: self.method,
             path: self.path,
             headers: self.headers,
             body,
-            content,
+            content: OnceLock::new(),
             version: self.version,
         }
     }
@@ -428,8 +443,8 @@ pub struct HttpRequest<'a> {
     method: Option<Method>,
     path: Cow<'a, str>,
     headers: Vec<(&'a str, &'a str)>,
-    // The body as received, and its text, which is only worked out from the bytes once a handler asks for it
-    body: &'a [u8],
+    // The body's bytes, and its text, which is only worked out from the bytes once a handler asks for it
+    body: Cow<'a, [u8]>,
     content: OnceLock<Cow<'a, str>>,
     version: &'a str,
 }
@@ -439,15 +454,12 @@ impl<'a> HttpRequest<'a> {
     // Unrecognized methods, versions, and transfer codings parse successfully so the server can answer them
     pub fn new(mut request: &'a str) -> Result<Self, ParseError> {
         let head = Head::parse(&mut request)?;
-        let content = match head.body(request.as_bytes())? {
-            Ok(body) => {
-                // A Content-Length that splits a character leaves a body that is not text
-                let text = request.get(..body.len()).ok_or(ParseError::InvalidContentLength)?;
-                Cow::Borrowed(text)
-            }
-            Err(decoded) => Cow::Owned(decoded),
-        };
-        Ok(head.into_request(b"", OnceLock::from(content)))
+        let body = head.body(request.as_bytes())?;
+        // A Content-Length that splits a character leaves a body that is not text
+        if matches!(body, Cow::Borrowed(_)) && !request.is_char_boundary(body.len()) {
+            return Err(ParseError::InvalidContentLength);
+        }
+        Ok(head.into_request(body))
     }
 
     // Parses a request straight from the bytes received, where only the head has to be valid UTF-8 up front and
@@ -460,11 +472,8 @@ impl<'a> HttpRequest<'a> {
         };
         let mut head = std::str::from_utf8(&request[..head_len]).ok()?;
         let parsed = Head::parse(&mut head).and_then(|parsed| {
-            let rest = &request[head_len..];
-            Ok(match parsed.body(rest)? {
-                Ok(body) => parsed.into_request(body, OnceLock::new()),
-                Err(decoded) => parsed.into_request(b"", OnceLock::from(Cow::Owned(decoded))),
-            })
+            let body = parsed.body(&request[head_len..])?;
+            Ok(parsed.into_request(body))
         });
         Some(parsed)
     }
@@ -487,8 +496,18 @@ impl<'a> HttpRequest<'a> {
         &self.path
     }
 
+    // The body as text, with any invalid UTF-8 replaced, see body for the bytes as they were sent
     pub fn content(&self) -> &str {
-        self.content.get_or_init(|| to_text(self.body))
+        self.content.get_or_init(|| match &self.body {
+            Cow::Borrowed(body) => to_text(body),
+            // A decoded body belongs to this request, so the text cannot borrow from it for 'a
+            Cow::Owned(body) => Cow::Owned(to_text(body).into_owned()),
+        })
+    }
+
+    // The body's bytes, with any chunked encoding removed
+    pub fn body(&self) -> &[u8] {
+        &self.body
     }
 
     pub fn version(&self) -> &'a str {

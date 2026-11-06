@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+use crate::http_request::{walk_chunks, ChunkError};
 use crate::ip_address::IpAddress;
 
 #[cfg(windows)]
@@ -56,16 +57,25 @@ fn header_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-// The value of the Content-Length header, or 0 if there isn't a valid one
-fn content_length(headers: &[u8]) -> usize {
-    String::from_utf8_lossy(headers)
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.eq_ignore_ascii_case("Content-Length").then(|| value.trim().parse().ok())?
-        })
-        .unwrap_or(0)
+// The value of the first header with this name
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+// Frames a chunked body starting at header_len
+fn chunked_request_len(buf: &[u8], header_len: usize) -> Framing {
+    let limit = header_len + MAX_BODY_BYTES;
+    match walk_chunks(&buf[header_len..], |_| {}) {
+        Ok(body_len) if header_len + body_len <= limit => Framing::Complete(header_len + body_len),
+        // Hand everything over so the parser answers it with a 400, rather than waiting for bytes that will not help
+        Err(ChunkError::Malformed) => Framing::Complete(buf.len()),
+        Err(ChunkError::Incomplete) if buf.len() <= limit => Framing::Incomplete,
+        // The limit applies to the body with its framing, which is all that is known before the end has arrived
+        _ => Framing::TooLarge,
+    }
 }
 
 // How far along the request in a connection's receive buffer is
@@ -78,18 +88,29 @@ pub(crate) enum Framing {
     TooLarge,
 }
 
-// Frames one request at the start of buf: the request line and headers, then Content-Length bytes of body
+// Frames one request at the start of buf: the request line and headers, then a body of Content-Length bytes or chunks
 // Shared by the Windows and linux listeners so both apply the same limits
 pub(crate) fn request_len(buf: &[u8]) -> Framing {
-    let Some(header_len) = header_end(buf) else {
-        if buf.len() > MAX_HEADER_BYTES {
+    let header_len = match header_end(buf) {
+        Some(header_len) if header_len <= MAX_HEADER_BYTES => header_len,
+        None if buf.len() <= MAX_HEADER_BYTES => return Framing::Incomplete,
+        _ => {
             log_error!("Request headers exceed {} bytes", MAX_HEADER_BYTES);
             return Framing::TooLarge;
         }
-        return Framing::Incomplete;
     };
+    let head = String::from_utf8_lossy(&buf[..header_len]);
 
-    let body_len = content_length(&buf[..header_len]);
+    // Only the first Transfer-Encoding counts, as in the parser, which rejects one sent alongside a Content-Length
+    if header_value(&head, "Transfer-Encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+        let framing = chunked_request_len(buf, header_len);
+        if matches!(framing, Framing::TooLarge) {
+            log_error!("Chunked request body exceeds {} bytes", MAX_BODY_BYTES);
+        }
+        return framing;
+    }
+
+    let body_len = header_value(&head, "Content-Length").and_then(|value| value.parse().ok()).unwrap_or(0);
     if body_len > MAX_BODY_BYTES {
         log_error!("Request body of {} bytes exceeds {} bytes", body_len, MAX_BODY_BYTES);
         return Framing::TooLarge;
@@ -156,5 +177,68 @@ mod tests {
 
         let body = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
         assert!(matches!(request_len(body.as_bytes()), Framing::TooLarge));
+    }
+
+    // A complete request with no body whose head is exactly len bytes
+    fn head_of_len(len: usize) -> Vec<u8> {
+        let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
+        head.resize(len - 4, b'a');
+        head.extend_from_slice(b"\r\n\r\n");
+        head
+    }
+
+    #[test]
+    fn request_len_applies_the_header_limit_to_a_complete_head() {
+        let at_limit = head_of_len(MAX_HEADER_BYTES);
+        assert!(matches!(request_len(&at_limit), Framing::Complete(n) if n == MAX_HEADER_BYTES));
+        assert!(matches!(request_len(&head_of_len(MAX_HEADER_BYTES + 1)), Framing::TooLarge));
+    }
+
+    #[test]
+    fn request_len_frames_chunked_bodies() {
+        let request = b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nTrailer: x\r\n\r\n";
+        // Every prefix past the head needs more bytes
+        for len in b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n".len()..request.len() {
+            assert!(matches!(request_len(&request[..len]), Framing::Incomplete), "prefix of {len} bytes");
+        }
+        assert!(matches!(request_len(request), Framing::Complete(n) if n == request.len()));
+
+        let mut pipelined = request.to_vec();
+        pipelined.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        assert!(matches!(request_len(&pipelined), Framing::Complete(n) if n == request.len()));
+    }
+
+    #[test]
+    fn request_len_hands_malformed_chunks_to_the_parser() {
+        let bad_size = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\n";
+        assert!(matches!(request_len(bad_size), Framing::Complete(n) if n == bad_size.len()));
+
+        let bad_end = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nabc\r\n";
+        assert!(matches!(request_len(bad_end), Framing::Complete(n) if n == bad_end.len()));
+    }
+
+    #[test]
+    fn request_len_rejects_oversized_chunked_bodies() {
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+
+        // Still arriving, and already over the limit
+        let mut unfinished = head.clone();
+        unfinished.extend_from_slice(format!("{:x}\r\n", MAX_BODY_BYTES * 2).as_bytes());
+        unfinished.resize(head.len() + MAX_BODY_BYTES + 1, b'a');
+        assert!(matches!(request_len(&unfinished), Framing::TooLarge));
+
+        // Finished, but over the limit
+        let mut finished = head.clone();
+        finished.extend_from_slice(format!("{:x}\r\n", MAX_BODY_BYTES + 1).as_bytes());
+        finished.resize(finished.len() + MAX_BODY_BYTES + 1, b'a');
+        finished.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert!(matches!(request_len(&finished), Framing::TooLarge));
+    }
+
+    #[test]
+    fn request_len_ignores_other_transfer_codings() {
+        // The parser leaves these for the server to answer with 501, so nothing more is waited for
+        let gzip = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n";
+        assert!(matches!(request_len(gzip), Framing::Complete(n) if n == gzip.len()));
     }
 }
