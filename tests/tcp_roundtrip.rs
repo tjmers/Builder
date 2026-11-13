@@ -352,7 +352,6 @@ fn slow_handlers_do_not_hold_up_an_open_connection() {
 }
 
 // A client that stops reading for longer than the receive idle timeout has not necessarily gone away
-#[cfg(target_os = "linux")]
 #[test]
 fn large_response_survives_a_client_pause() {
     const BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -447,4 +446,128 @@ fn non_utf8_body_is_available_byte_for_byte() {
         b"POST /hex HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n\xff\x00\r\n2\r\n\xfe\x80\r\n0\r\n\r\n",
     );
     assert!(response.ends_with("\r\n\r\nff00fe80"), "response: {response:?}");
+}
+
+// A header that is not UTF-8 (Latin-1 here) has its invalid bytes replaced, which makes the head longer than it was
+// sent, and that must not reach the body, whose lengths count the bytes as they were sent
+#[test]
+fn non_utf8_header_leaves_the_body_as_it_was_sent() {
+    let port = 38121;
+    start_server(port);
+
+    let response = send(
+        port,
+        b"POST /hex HTTP/1.1\r\nHost: localhost\r\nX-Name: caf\xe9\r\nContent-Length: 4\r\n\r\n\xff\x00\xfe\x80",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
+    assert!(response.ends_with("\r\n\r\nff00fe80"), "response: {response:?}");
+
+    // A length that would end partway through a replaced byte
+    let response = send(port, b"POST /hex HTTP/1.1\r\nHost: localhost\r\nX-Name: caf\xe9\r\nContent-Length: 2\r\n\r\n\xff\x00");
+    assert!(response.ends_with("\r\n\r\nff00"), "response: {response:?}");
+
+    let response = send(
+        port,
+        b"POST /hex HTTP/1.1\r\nHost: localhost\r\nX-Name: caf\xe9\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n\xff\x00\r\n2\r\n\xfe\x80\r\n0\r\n\r\n",
+    );
+    assert!(response.ends_with("\r\n\r\nff00fe80"), "response: {response:?}");
+}
+
+// The parser rejects Transfer-Encoding sent alongside Content-Length as a likely smuggling attempt, so the listener
+// must hand the request over as soon as the head arrives instead of waiting for chunks that never come
+#[test]
+fn chunked_with_content_length_gets_400_straight_away() {
+    let port = 38122;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    let start = Instant::now();
+    let response = send(
+        port,
+        b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello",
+    );
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "response: {response:?}");
+    assert!(start.elapsed() < Duration::from_secs(2), "the 400 took {:?}", start.elapsed());
+}
+
+// The parser ignores empty lines before the request line and takes LF or CRLF line endings in any mix, so the
+// listener has to find the end of the head the same way
+#[test]
+fn head_is_framed_the_way_the_parser_reads_it() {
+    let port = 38123;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    let response = send(port, b"\r\n\r\nGET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
+
+    let start = Instant::now();
+    let response = send(port, b"GET /index HTTP/1.1\nHost: localhost\n\r\n");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
+    assert!(start.elapsed() < Duration::from_secs(2), "the response took {:?}", start.elapsed());
+}
+
+// Closing a connection with client data still unread resets it, which must not take the response with it
+// The extra bytes stand in for anything a client sends past its request, like a pipelined request
+// Only on linux, where a client keeps what it had already received when the reset arrives
+#[cfg(target_os = "linux")]
+#[test]
+fn response_is_sent_before_a_close_with_unread_data() {
+    let port = 38124;
+    start_server(port);
+    send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    for _ in 0..20 {
+        // More than the server reads in one receive, all in one write, so some is still unread when it closes
+        let mut request = b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
+        request.resize(request.len() + 64 * 1024, b'a');
+
+        let mut stream = connect(port);
+        // The server may reset the connection before taking all of this
+        let _ = stream.write_all(&request);
+        // Read up to the reset, which read_to_end reports after handing over what arrived before it
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
+        assert!(response.ends_with("\r\n\r\nindex"), "response: {response:?}");
+    }
+}
+
+// A request that has arrived but is waiting for a worker is not idle, however long the handlers ahead of it take
+// The server is pinned to one CPU so it has the fewest workers the listener ever runs (five), and each batch of
+// handlers takes half the idle timeout, so the last requests wait well past it
+#[cfg(target_os = "linux")]
+#[test]
+fn requests_waiting_for_a_worker_are_not_closed_as_idle() {
+    let port = 38125;
+    thread::spawn(move || {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(libc::sched_getcpu() as usize, &mut set);
+            assert_eq!(libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set), 0);
+        }
+        let mut s = Server::new(());
+        s.add_endpoint(Method::Get, "/slow", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+            thread::sleep(Duration::from_millis(2500));
+            HttpResponseBuilder::from_text(Status::Ok, "slow").build()
+        });
+        s.run(port);
+    });
+    drop(connect(port));
+
+    let clients: Vec<_> = (0..14)
+        .map(|_| {
+            thread::spawn(move || {
+                let mut stream = connect(port);
+                stream.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
+                String::from_utf8_lossy(&response).into_owned()
+            })
+        })
+        .collect();
+    let responses: Vec<String> = clients.into_iter().map(|client| client.join().unwrap()).collect();
+    let answered = responses.iter().filter(|response| response.ends_with("\r\n\r\nslow")).count();
+    assert_eq!(answered, responses.len(), "only {answered} of {} requests were answered", responses.len());
 }

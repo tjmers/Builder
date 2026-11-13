@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::http_request::{HttpRequest, Method, ParseError};
+use crate::http_request::{to_text, HttpRequest, Method, ParseError};
 use crate::http_response::{HttpResponse, HttpResponseBuilder, Status, VERSIONS_SUPPORTED};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
@@ -188,11 +188,14 @@ impl<S> Server<S> {
     fn handle_raw<'s>(&'s self, request: &[u8], addr: IpAddress) -> Cow<'s, [u8]> {
         // Only the head is checked as UTF-8 here, and the body only if the handler reads it, since validating a
         // 4kb body cost more than routing the request
-        match HttpRequest::from_bytes(request) {
-            Some(parsed) => self.respond(parsed, &addr),
-            // A head that is not UTF-8 has its invalid sequences replaced, and the parser judges what is left
-            None => self.respond(HttpRequest::new(&String::from_utf8_lossy(request)), &addr),
-        }
+        let (head, rest) = match HttpRequest::split_head(request) {
+            Ok(parts) => parts,
+            Err(e) => return self.respond(Err(e), &addr),
+        };
+        // A head that is not UTF-8 has its invalid sequences replaced, and the parser judges what is left
+        // Only the head: the body's lengths count the bytes as they were sent, so it must stay as it is
+        let head = to_text(head);
+        self.respond(HttpRequest::from_parts(&head, rest), &addr)
     }
 
     fn respond(&self, parsed: Result<HttpRequest<'_>, ParseError>, addr: &IpAddress) -> Cow<'_, [u8]> {

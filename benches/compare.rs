@@ -22,8 +22,11 @@ use common::{BODY_BYTES, CLIENT_COUNTS};
 // The response body every server sends, built once
 static BODY: [u8; BODY_BYTES] = [b'a'; BODY_BYTES];
 
+// A server's name in the report, its port, and the function that starts it
+type Competitor = (&'static str, u16, fn(u16));
+
 // Each server's name in the report and its port, outside the 381xx range used by the tests and the throughput bench
-const SERVERS: [(&str, u16, fn(u16)); 5] = [
+const SERVERS: [Competitor; 5] = [
     ("builder", 38202, start_builder),
     ("std", 38203, start_std),
     ("axum", 38204, start_axum),

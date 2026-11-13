@@ -142,7 +142,7 @@ fn next_line_bytes<'a>(request: &mut &'a [u8]) -> Result<&'a [u8], ParseError> {
 
 // The length of the head: any empty lines before the request line, the request line, and the headers through the
 // empty line that ends them, split into lines the same way as next_line
-fn head_len(request: &[u8]) -> Result<usize, ParseError> {
+pub(crate) fn head_len(request: &[u8]) -> Result<usize, ParseError> {
     let mut rest = request;
     while next_line_bytes(&mut rest)?.is_empty() {}
     while !next_line_bytes(&mut rest)?.is_empty() {}
@@ -264,42 +264,65 @@ pub(crate) enum ChunkError {
 }
 
 // RFC 9112 7.1: chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF, ending with a 0 size chunk and trailers
-// Passes each chunk's data to on_chunk and returns how many bytes the whole body takes up, including the framing
+// Walks a chunked body that may still be arriving, picking up where it left off each time more of it has come in,
+// so a body sent as many small chunks in many small pieces is only ever read once
 // Framing a request and decoding it both go through here, so they cannot disagree about where a body ends
-pub(crate) fn walk_chunks<'a>(mut body: &'a [u8], mut on_chunk: impl FnMut(&'a [u8])) -> Result<usize, ChunkError> {
-    fn line<'a>(body: &mut &'a [u8]) -> Result<&'a [u8], ChunkError> {
-        next_line_bytes(body).map_err(|_| ChunkError::Incomplete)
+#[derive(Default)]
+pub(crate) struct ChunkWalker {
+    // How much of the body is behind it: whole chunks, and once in_trailers whole trailer lines too
+    offset: usize,
+    // Whether the 0 size chunk has been passed, leaving only the trailers
+    in_trailers: bool,
+}
+
+impl ChunkWalker {
+    // Carries on through body, which must be the same body as last time with any new bytes on the end
+    // Passes the data of each chunk it gets past to on_chunk, once, and returns how many bytes the whole body takes
+    // up, including the framing, once its end has arrived
+    pub(crate) fn advance<'a>(&mut self, body: &'a [u8], mut on_chunk: impl FnMut(&'a [u8])) -> Result<usize, ChunkError> {
+        fn line<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8], ChunkError> {
+            next_line_bytes(rest).map_err(|_| ChunkError::Incomplete)
+        }
+        let mut rest = &body[self.offset..];
+
+        while !self.in_trailers {
+            // Chunk extensions after ';' are ignored
+            let size_line = line(&mut rest)?;
+            let size = trim_bytes(size_line.split(|&b| b == b';').next().unwrap_or_default());
+            if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
+                return Err(ChunkError::Malformed);
+            }
+            let size = std::str::from_utf8(size)
+                .ok()
+                .and_then(|size| usize::from_str_radix(size, 16).ok())
+                .ok_or(ChunkError::Malformed)?;
+            if size == 0 {
+                self.in_trailers = true;
+            } else {
+                let data = rest.get(..size).ok_or(ChunkError::Incomplete)?;
+                rest = &rest[size..];
+                if !line(&mut rest)?.is_empty() {
+                    return Err(ChunkError::Malformed);
+                }
+                on_chunk(data);
+            }
+            self.offset = body.len() - rest.len();
+        }
+
+        // Trailer fields are ignored, up to the terminating empty line
+        loop {
+            let trailer = line(&mut rest)?;
+            self.offset = body.len() - rest.len();
+            if trailer.is_empty() {
+                return Ok(self.offset);
+            }
+        }
     }
-    let start = body.len();
+}
 
-    loop {
-        // Chunk extensions after ';' are ignored
-        let size_line = line(&mut body)?;
-        let size = trim_bytes(size_line.split(|&b| b == b';').next().unwrap_or_default());
-        if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
-            return Err(ChunkError::Malformed);
-        }
-        let size = std::str::from_utf8(size)
-            .ok()
-            .and_then(|size| usize::from_str_radix(size, 16).ok())
-            .ok_or(ChunkError::Malformed)?;
-        if size == 0 {
-            break;
-        }
-
-        let data = body.get(..size).ok_or(ChunkError::Incomplete)?;
-        on_chunk(data);
-        body = &body[size..];
-
-        if !line(&mut body)?.is_empty() {
-            return Err(ChunkError::Malformed);
-        }
-    }
-
-    // Trailer fields are ignored, up to the terminating empty line
-    while !line(&mut body)?.is_empty() {}
-
-    Ok(start - body.len())
+// Walks a chunked body that has arrived in full
+pub(crate) fn walk_chunks<'a>(body: &'a [u8], on_chunk: impl FnMut(&'a [u8])) -> Result<usize, ChunkError> {
+    ChunkWalker::default().advance(body, on_chunk)
 }
 
 fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, ParseError> {
@@ -309,15 +332,89 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, ParseError> {
 }
 
 // Content-Length = 1*DIGIT
-fn parse_length(value: &str) -> Option<usize> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+fn parse_length(value: &[u8]) -> Option<usize> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    value.parse().ok()
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+// What a request's headers say about its body
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyKind {
+    None,
+    // Content-Length bytes
+    Length(usize),
+    Chunked,
+    // A transfer coding other than chunked, which is left for the server to answer with 501
+    OtherCoding,
+}
+
+// Gathers the headers that decide a request's body as the headers go by
+// The listener framing a request and the parser reading it both feed their headers through here, so they cannot
+// disagree about what kind of body a request has
+#[derive(Default)]
+struct BodyHeaders {
+    content_length: Option<usize>,
+    invalid_length: bool,
+    // Whether the first Transfer-Encoding is chunked, and only the first counts
+    chunked: Option<bool>,
+}
+
+impl BodyHeaders {
+    // Takes one header, with the whitespace around its value already trimmed
+    fn observe(&mut self, name: &[u8], value: &[u8]) {
+        if name.eq_ignore_ascii_case(b"content-length") {
+            // RFC 9112 6.3: repeated Content-Length headers must all agree
+            match parse_length(value) {
+                Some(length) if self.content_length.is_none_or(|existing| existing == length) => self.content_length = Some(length),
+                _ => self.invalid_length = true,
+            }
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") && self.chunked.is_none() {
+            self.chunked = Some(value.eq_ignore_ascii_case(b"chunked"));
+        }
+    }
+
+    // RFC 9112 6.3: the body comes from Transfer-Encoding or Content-Length
+    fn kind(&self) -> Result<BodyKind, ParseError> {
+        // RFC 9112 6.1: both together is a likely smuggling attempt
+        if self.invalid_length || (self.content_length.is_some() && self.chunked.is_some()) {
+            return Err(ParseError::InvalidContentLength);
+        }
+        Ok(match (self.chunked, self.content_length) {
+            (Some(true), _) => BodyKind::Chunked,
+            (Some(false), _) => BodyKind::OtherCoding,
+            (None, Some(length)) => BodyKind::Length(length),
+            (None, None) => BodyKind::None,
+        })
+    }
+}
+
+// Reads just enough of a request's head to frame its body: the length of the head (as head_len) and the kind of
+// body its headers call for, which is an error when the parser is going to reject them
+// None if the head has not all arrived yet
+// Lines are split and headers read the same way as in Head::parse, and anything else the parser objects to is left
+// for it to find
+pub(crate) fn scan_head(request: &[u8]) -> Option<(usize, Result<BodyKind, ParseError>)> {
+    let mut rest = request;
+    // Empty lines before the request line, and then the request line itself
+    while next_line_bytes(&mut rest).ok()?.is_empty() {}
+
+    let mut body = BodyHeaders::default();
+    loop {
+        let line = next_line_bytes(&mut rest).ok()?;
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            body.observe(&line[..colon], trim_bytes(&line[colon + 1..]));
+        }
+    }
+    Some((request.len() - rest.len(), body.kind()))
 }
 
 // Bytes as text, borrowed when they are valid UTF-8 and with invalid sequences replaced otherwise
-fn to_text(bytes: &[u8]) -> Cow<'_, str> {
+pub(crate) fn to_text(bytes: &[u8]) -> Cow<'_, str> {
     // from_utf8 has a fast path for ASCII that from_utf8_lossy lacks
     match std::str::from_utf8(bytes) {
         Ok(text) => Cow::Borrowed(text),
@@ -331,8 +428,7 @@ struct Head<'a> {
     path: Cow<'a, str>,
     headers: Vec<(&'a str, &'a str)>,
     version: &'a str,
-    content_length: Option<usize>,
-    transfer_encoding: Option<&'a str>,
+    body: BodyKind,
 }
 
 impl<'a> Head<'a> {
@@ -360,9 +456,7 @@ impl<'a> Head<'a> {
         // Headers: KEY: VALUE, terminated by an empty line
         let mut headers = Vec::new();
         let mut hosts = 0;
-        let mut content_length = None;
-        let mut invalid_length = false;
-        let mut transfer_encoding = None;
+        let mut body = BodyHeaders::default();
         loop {
             let line = next_line(request)?;
             if line.is_empty() {
@@ -377,14 +471,8 @@ impl<'a> Head<'a> {
             }
             if key.eq_ignore_ascii_case("host") {
                 hosts += 1;
-            } else if key.eq_ignore_ascii_case("content-length") {
-                // RFC 9112 6.3: repeated Content-Length headers must all agree
-                match parse_length(value) {
-                    Some(length) if content_length.is_none_or(|existing| existing == length) => content_length = Some(length),
-                    _ => invalid_length = true,
-                }
-            } else if key.eq_ignore_ascii_case("transfer-encoding") && transfer_encoding.is_none() {
-                transfer_encoding = Some(value);
+            } else {
+                body.observe(key.as_bytes(), value.as_bytes());
             }
             headers.push((key, value));
         }
@@ -393,35 +481,26 @@ impl<'a> Head<'a> {
         if hosts > 1 || (hosts == 0 && version == "HTTP/1.1") {
             return Err(ParseError::InvalidHost);
         }
-        // RFC 9112 6.1: both together is a likely smuggling attempt
-        if invalid_length || (content_length.is_some() && transfer_encoding.is_some()) {
-            return Err(ParseError::InvalidContentLength);
-        }
+        let body = body.kind()?;
 
         Ok(Head {
             method: parse_method(method),
             path,
             headers,
             version,
-            content_length,
-            transfer_encoding,
+            body,
         })
     }
 
-    // RFC 9112 6.3: determines the body from Transfer-Encoding or Content-Length
+    // Takes the body off the front of rest, which is what follows the head
     // Borrowed from rest unless it had to be decoded
     fn body<'b>(&self, rest: &'b [u8]) -> Result<Cow<'b, [u8]>, ParseError> {
-        if let Some(encoding) = self.transfer_encoding {
+        match self.body {
+            BodyKind::Chunked => decode_chunked(rest).map(Cow::Owned),
+            BodyKind::Length(length) if rest.len() < length => Err(ParseError::IncompleteBody),
+            BodyKind::Length(length) => Ok(Cow::Borrowed(&rest[..length])),
             // Unsupported codings are left for the server to answer with 501
-            if !encoding.eq_ignore_ascii_case("chunked") {
-                return Ok(Cow::Borrowed(b""));
-            }
-            return decode_chunked(rest).map(Cow::Owned);
-        }
-        match self.content_length {
-            Some(length) if rest.len() < length => Err(ParseError::IncompleteBody),
-            Some(length) => Ok(Cow::Borrowed(&rest[..length])),
-            None => Ok(Cow::Borrowed(b"")),
+            BodyKind::None | BodyKind::OtherCoding => Ok(Cow::Borrowed(b"")),
         }
     }
 
@@ -462,20 +541,18 @@ impl<'a> HttpRequest<'a> {
         Ok(head.into_request(body))
     }
 
-    // Parses a request straight from the bytes received, where only the head has to be valid UTF-8 up front and
-    // the body is only checked once a handler asks for its content
-    // None if the head is not valid UTF-8, in which case the caller decides how to handle it
-    pub(crate) fn from_bytes(request: &'a [u8]) -> Option<Result<Self, ParseError>> {
-        let head_len = match head_len(request) {
-            Ok(head_len) => head_len,
-            Err(e) => return Some(Err(e)),
-        };
-        let mut head = std::str::from_utf8(&request[..head_len]).ok()?;
-        let parsed = Head::parse(&mut head).and_then(|parsed| {
-            let body = parsed.body(&request[head_len..])?;
-            Ok(parsed.into_request(body))
-        });
-        Some(parsed)
+    // Splits the bytes received into the head and what follows it
+    pub(crate) fn split_head(request: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
+        Ok(request.split_at(head_len(request)?))
+    }
+
+    // Parses a request from its head and the bytes that followed it, as split by split_head
+    // Only the head has to be text, so the body is taken from the bytes exactly as they were sent and is only
+    // checked as UTF-8 once a handler asks for its content
+    pub(crate) fn from_parts(mut head: &'a str, rest: &'a [u8]) -> Result<Self, ParseError> {
+        let parsed = Head::parse(&mut head)?;
+        let body = parsed.body(rest)?;
+        Ok(parsed.into_request(body))
     }
 
     // Header names are case-insensitive

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use libc::{c_int, c_void, epoll_event, sockaddr, sockaddr_in, socklen_t};
 
-use super::{log_closed_early, request_len, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT};
+use super::{log_closed_early, Framer, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT, SEND_IDLE_TIMEOUT};
 use crate::ip_address::IpAddress;
 
 const INVALID_SOCKET: NativeSocket = -1;
@@ -25,11 +25,6 @@ const RECV_BYTES: usize = 16 * 1024;
 // How often parked connections are checked for ones that have gone idle
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-// A connection with a response left to send is closed after this long without the client taking any of it
-// Longer than IDLE_TIMEOUT since a client that pauses partway through a download has not necessarily gone away, but
-// still bounded so a client that stops reading cannot hold on to the response forever
-const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
 // How long to wait before accepting again when the process is out of file descriptors or memory
 // The connection stays queued and accept fails immediately until something is freed, so retrying straight away would
 // only spin a CPU while the threads that could free something wait for it
@@ -40,13 +35,22 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 // reaches a worker and is closed after IDLE_TIMEOUT
 const DEFER_ACCEPT_SECS: c_int = 1;
 
-// Responses up to this size are closed without TIME_WAIT (see bind_socket), larger ones get a normal close
-// The fast close resets the connection once the client has acknowledged the whole response, and a client that
-// discards unread data on a reset (Windows does) could lose the end of a large response it is still reading
-const FAST_CLOSE_MAX_BYTES: usize = 64 * 1024;
-
 // How often the rescue thread checks for workers that have stopped making progress (see Rescue)
 const RESCUE_INTERVAL: Duration = Duration::from_millis(10);
+
+// How many checks in a row have to find nothing going on before the rescue thread stops checking and waits for the
+// next connection to arrive instead, so a server with no traffic is not woken a hundred times a second
+const RESCUE_QUIET_CHECKS: u32 = 10;
+
+// The most connections the rescue thread takes from one stalled worker's socket in one check
+// It then moves on to the other sockets and the idle sweep and comes back on the next check, so connections
+// flooding in on one socket cannot keep it from everything else
+const RESCUE_BATCH: usize = 64;
+
+// The rescue thread takes nothing over while this many connections are parked
+// The rest wait in the kernel's queue, where they take up no file descriptor and the kernel refuses new ones once
+// it is full, instead of piling up here until the process runs out of descriptors
+const MAX_PARKED: usize = 512;
 
 // Logs the last OS error, prefixed by the call that failed
 fn log_os_error(call: &str) {
@@ -66,10 +70,9 @@ fn recv(conn: NativeSocket, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
 // Sends as much of data as the OS accepts, returning the number of bytes sent
 fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
     // MSG_NOSIGNAL so a client that already hung up gives an error instead of a SIGPIPE that kills the server
-    // MSG_MORE holds back the final partial segment, so the FIN sent when the connection is closed straight after
-    // rides on it instead of going out as a packet of its own
-    let flags = libc::MSG_NOSIGNAL | libc::MSG_MORE;
-    let n = unsafe { libc::send(conn, data.as_ptr() as *const c_void, data.len(), flags) };
+    // No MSG_MORE: it would hold the end of the response back until close, and a close with client data still unread
+    // (a pipelined request, say) resets the connection and discards whatever has not been sent
+    let n = unsafe { libc::send(conn, data.as_ptr() as *const c_void, data.len(), libc::MSG_NOSIGNAL) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -104,16 +107,10 @@ fn bind_socket(socket: NativeSocket, port: i32) -> io::Result<()> {
     // Only queue a connection for accept once its first data has arrived, so the worker is woken once with the
     // request ready to read, instead of once for the handshake and again (after an EAGAIN and an epoll_ctl) for the request
     set_option(socket, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, DEFER_ACCEPT_SECS)?;
-    // The server closes first after every response, which normally leaves the connection in TIME_WAIT for a minute
-    // A negative TCP_LINGER2 instead forgets the connection as soon as the client has acknowledged the whole response
-    // and the FIN, skipping TIME_WAIT
-    // Without it every port a client reuses lands on one of these TIME_WAIT sockets, and now and then the kernel drops
-    // the new SYN, stalling that client's connect for the full one second SYN retransmit timeout
-    // It also saves creating and tearing down the TIME_WAIT socket and the client's FIN, one packet per connection
-    // The trade-off: the client's ACK of the FIN is answered with a reset, and a client that discards unread data on
-    // a reset could lose a response it has received but not yet read (Linux keeps it), so large responses opt out
-    // in Connection::set_response
-    set_option(socket, libc::IPPROTO_TCP, libc::TCP_LINGER2, -1)?;
+    // TCP_LINGER2 is left alone, so the server closing first after every response leaves each connection in
+    // TIME_WAIT as usual
+    // A negative value would skip that, but only by answering the client's ACK of the FIN with a reset, and a
+    // client or proxy that discards unread data on a reset could then lose a response it had already received
 
     let mut addr: sockaddr_in = unsafe { mem::zeroed() };
     addr.sin_family = libc::AF_INET as libc::sa_family_t;
@@ -148,6 +145,17 @@ fn start_listening(socket: NativeSocket) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+// Whether socket is ready for what a parked connection is waiting on, without waiting for it
+fn is_ready(socket: NativeSocket, interest: Interest) -> bool {
+    let events = match interest {
+        Interest::None => return false,
+        Interest::Read => libc::POLLIN,
+        Interest::Write => libc::POLLOUT,
+    };
+    let mut poll = libc::pollfd { fd: socket, events, revents: 0 };
+    unsafe { libc::poll(&mut poll, 1, 0) > 0 && poll.revents & events != 0 }
 }
 
 // Whether a failed accept means the process has run out of something, rather than something being wrong with the
@@ -217,8 +225,9 @@ impl Interest {
 // A connection from accept until it is closed
 struct Connection<'a> {
     ip: IpAddress,
-    // The request received so far
+    // The request received so far, and how far along it is
     request: Vec<u8>,
+    framer: Framer,
     // Once the request is handled, the response and how much of it has been sent
     response: Option<(Cow<'a, [u8]>, usize)>,
     interest: Interest,
@@ -240,6 +249,7 @@ impl<'a> Connection<'a> {
         Connection {
             ip,
             request,
+            framer: Framer::default(),
             response: None,
             interest: Interest::None,
             last_active: Instant::now(),
@@ -250,7 +260,7 @@ impl<'a> Connection<'a> {
     // Returns the request's length once it is complete
     fn recv_request(&mut self, fd: NativeSocket) -> Result<Option<usize>, ()> {
         loop {
-            match request_len(&self.request) {
+            match self.framer.advance(&self.request) {
                 Framing::Complete(total) => return Ok(Some(total)),
                 Framing::TooLarge => return Err(()),
                 Framing::Incomplete => {}
@@ -278,18 +288,6 @@ impl<'a> Connection<'a> {
                 }
             }
         }
-    }
-
-    // Stores the response to send
-    // A large response gets a normal close with TIME_WAIT instead of the fast close set up in bind_socket
-    fn set_response(&mut self, fd: NativeSocket, response: Cow<'a, [u8]>) {
-        if response.len() > FAST_CLOSE_MAX_BYTES {
-            // 0 means the system default
-            if let Err(e) = set_option(fd, libc::IPPROTO_TCP, libc::TCP_LINGER2, 0) {
-                log_error!("Failed to restore the default close for a large response: {}", e);
-            }
-        }
-        self.response = Some((response, 0));
     }
 
     // Sends as much of the response as the socket takes
@@ -411,7 +409,7 @@ impl<'a, C> TcpListener<'a, C> {
             } else {
                 conn.request.clear();
             }
-            conn.set_response(fd, response);
+            conn.response = Some((response, 0));
         }
 
         match conn.send_response(fd) {
@@ -508,6 +506,11 @@ impl<'a, C> Shared<'_, 'a, C> {
     fn close_idle(&self) {
         self.parked().retain(|&fd, conn| {
             if !conn.is_idle() {
+                return true;
+            }
+            // One whose socket is ready is not idle: the client has done its part, and it is waiting for a parked
+            // worker to come free, as it would have waited in the kernel's queue for accept
+            if is_ready(fd, conn.interest) {
                 return true;
             }
             match &conn.response {
@@ -638,54 +641,85 @@ struct Watched<'p> {
 struct Rescue<'s, 'l, 'a, 'p, C> {
     shared: &'s Shared<'l, 'a, C>,
     watched: Vec<Watched<'p>>,
+    // One entry per watched socket, in the same order, kept between checks to save building it for each one
+    ready: Vec<libc::pollfd>,
     // Whether the last accept ran out of resources, so a shortage is logged once instead of on every retry
     short: bool,
     // When to try again after running out of resources
     paused_until: Instant,
 }
 
-impl<C> Rescue<'_, '_, '_, '_, C> {
+impl<'s, 'l, 'a, 'p, C> Rescue<'s, 'l, 'a, 'p, C> {
+    fn new(shared: &'s Shared<'l, 'a, C>, watched: Vec<Watched<'p>>) -> Self {
+        let ready = watched.iter().map(|w| libc::pollfd { fd: w.socket, events: libc::POLLIN, revents: 0 }).collect();
+        Rescue { shared, watched, ready, short: false, paused_until: Instant::now() }
+    }
+
     fn run(&mut self) -> ! {
-        let mut last_sweep = Instant::now();
+        let mut next_sweep = Instant::now() + SWEEP_INTERVAL;
+        // How many checks in a row found nothing going on
+        let mut quiet = 0;
         loop {
-            thread::sleep(RESCUE_INTERVAL);
-            if Instant::now() >= self.paused_until {
-                self.check_workers();
+            if quiet >= RESCUE_QUIET_CHECKS {
+                // Nothing is going on, so sleep until a connection arrives on any worker's socket or the sweep is due
+                // A connection its worker cannot get to leaves the socket readable, so this returns straight away
+                // for as long as there is something to rescue
+                self.poll_sockets(next_sweep.saturating_duration_since(Instant::now()));
             }
-            if last_sweep.elapsed() >= SWEEP_INTERVAL {
+            thread::sleep(RESCUE_INTERVAL);
+            let active = Instant::now() < self.paused_until || self.check_workers();
+            quiet = if active { 0 } else { quiet.saturating_add(1) };
+
+            if Instant::now() >= next_sweep {
                 self.shared.close_idle();
-                last_sweep = Instant::now();
+                next_sweep = Instant::now() + SWEEP_INTERVAL;
             }
         }
     }
 
-    fn check_workers(&mut self) {
-        let mut ready: Vec<libc::pollfd> = self.watched.iter().map(|w| libc::pollfd { fd: w.socket, events: libc::POLLIN, revents: 0 }).collect();
-        let polled = unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, 0) };
-        if polled < 0 {
+    // Finds which watched sockets have connections queued, waiting up to timeout for one to arrive
+    // Returns false if none have
+    fn poll_sockets(&mut self, timeout: Duration) -> bool {
+        // Rounded up, so a wait for the sweep does not end just before it is due
+        let millis = timeout.as_micros().div_ceil(1000).min(c_int::MAX as u128) as c_int;
+        let polled = unsafe { libc::poll(self.ready.as_mut_ptr(), self.ready.len() as libc::nfds_t, millis) };
+        if polled < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             log_os_error("poll");
         }
-        for (i, poll) in ready.iter().enumerate() {
+        polled > 0
+    }
+
+    // Takes over from every worker that has made no progress since the last check while connections wait on its socket
+    // Returns whether anything is going on: a worker made progress, or connections are waiting
+    fn check_workers(&mut self) -> bool {
+        let mut active = self.poll_sockets(Duration::ZERO);
+        let waiting = active;
+        for i in 0..self.watched.len() {
             let watched = &mut self.watched[i];
             let progress = watched.progress.0.load(Ordering::Relaxed);
             let stalled = progress == watched.seen;
             watched.seen = progress;
-            if polled > 0 && stalled && poll.revents & libc::POLLIN != 0 {
+            active |= !stalled;
+            if waiting && stalled && self.ready[i].revents & libc::POLLIN != 0 {
                 let socket = watched.socket;
                 self.take_over(socket);
             }
         }
+        active
     }
 
-    // Moves every connection queued on socket to the parked workers
+    // Moves the connections queued on socket to the parked workers, up to RESCUE_BATCH of them
     // The socket is non-blocking only for this, so this cannot get stuck if its worker wakes and takes them first
     // A worker already waiting in accept stays waiting, and one arriving meanwhile just tries again
     fn take_over(&mut self, socket: NativeSocket) {
+        if self.shared.parked().len() >= MAX_PARKED {
+            return;
+        }
         if let Err(e) = set_nonblocking(socket, true) {
             log_error!("Failed to make a stalled worker's socket non-blocking: {}", e);
             return;
         }
-        loop {
+        for _ in 0..RESCUE_BATCH {
             match self.shared.listener.accept(socket) {
                 Ok((fd, ip)) => {
                     self.short = false;
@@ -793,7 +827,7 @@ impl<C: Sync> TcpListener<'_, C> {
                 .zip(&progress)
                 .map(|(&(socket, _), progress)| Watched { socket, progress, seen: 0 })
                 .collect();
-            Rescue { shared, watched, short: false, paused_until: Instant::now() }.run()
+            Rescue::new(shared, watched).run()
         })
     }
 }

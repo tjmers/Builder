@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use crate::http_request::{walk_chunks, ChunkError};
+use crate::http_request::{scan_head, BodyKind, ChunkError, ChunkWalker};
 use crate::ip_address::IpAddress;
 
 #[cfg(windows)]
@@ -39,44 +39,14 @@ pub struct TcpListener<'a, C> {
 // Idle connections are swept periodically, so the effective limit is up to a sweep interval longer
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+// A connection with a response left to send is closed after this long without the client taking any of it
+// Longer than IDLE_TIMEOUT since a client that pauses partway through a download has not necessarily gone away, but
+// still bounded so a client that stops reading cannot hold on to the response forever
+pub(crate) const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // Requests over these limits are dropped
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
-
-// Finds the end of the headers (just past the blank line), accepting CRLF or bare LF line endings
-// Stops at the first blank line, so a large body after the headers is never scanned
-fn header_end(buf: &[u8]) -> Option<usize> {
-    let mut from = 0;
-    while let Some(i) = buf[from..].iter().position(|&b| b == b'\n').map(|i| i + from) {
-        match &buf[i + 1..] {
-            [b'\n', ..] => return Some(i + 2),
-            [b'\r', b'\n', ..] if i > 0 && buf[i - 1] == b'\r' => return Some(i + 3),
-            _ => from = i + 1,
-        }
-    }
-    None
-}
-
-// The value of the first header with this name
-fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    head.lines().skip(1).find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case(name).then(|| value.trim())
-    })
-}
-
-// Frames a chunked body starting at header_len
-fn chunked_request_len(buf: &[u8], header_len: usize) -> Framing {
-    let limit = header_len + MAX_BODY_BYTES;
-    match walk_chunks(&buf[header_len..], |_| {}) {
-        Ok(body_len) if header_len + body_len <= limit => Framing::Complete(header_len + body_len),
-        // Hand everything over so the parser answers it with a 400, rather than waiting for bytes that will not help
-        Err(ChunkError::Malformed) => Framing::Complete(buf.len()),
-        Err(ChunkError::Incomplete) if buf.len() <= limit => Framing::Incomplete,
-        // The limit applies to the body with its framing, which is all that is known before the end has arrived
-        _ => Framing::TooLarge,
-    }
-}
 
 // How far along the request in a connection's receive buffer is
 pub(crate) enum Framing {
@@ -88,39 +58,76 @@ pub(crate) enum Framing {
     TooLarge,
 }
 
-// Frames one request at the start of buf: the request line and headers, then a body of Content-Length bytes or chunks
-// Shared by the Windows and linux listeners so both apply the same limits
-pub(crate) fn request_len(buf: &[u8]) -> Framing {
-    let header_len = match header_end(buf) {
-        Some(header_len) if header_len <= MAX_HEADER_BYTES => header_len,
-        None if buf.len() <= MAX_HEADER_BYTES => return Framing::Incomplete,
-        _ => {
-            log_error!("Request headers exceed {} bytes", MAX_HEADER_BYTES);
-            return Framing::TooLarge;
+// What a Framer knows about its request so far
+#[derive(Default)]
+enum Stage {
+    // The head has not all arrived
+    #[default]
+    Head,
+    // The head has been read, and the request ends this many bytes in
+    Length(usize),
+    // The head, of header_len bytes, has been read and is followed by chunks
+    Chunked { header_len: usize, chunks: ChunkWalker },
+}
+
+// Frames the one request a connection sends: the request line and headers, then a body of Content-Length bytes or
+// chunks
+// It keeps its place between receives, so the head is read once and each chunk once, however many pieces the
+// request arrives in
+// Shared by the Windows and linux listeners so both apply the same limits, and it reads the head with the parser's
+// own scan (scan_head), so the two cannot disagree about where a request ends or whether it is valid
+#[derive(Default)]
+pub(crate) struct Framer {
+    stage: Stage,
+}
+
+impl Framer {
+    // buf is everything received so far, which only ever grows between calls
+    pub(crate) fn advance(&mut self, buf: &[u8]) -> Framing {
+        if let Stage::Head = self.stage {
+            let (header_len, body) = match scan_head(buf) {
+                Some((header_len, body)) if header_len <= MAX_HEADER_BYTES => (header_len, body),
+                None if buf.len() <= MAX_HEADER_BYTES => return Framing::Incomplete,
+                _ => {
+                    log_error!("Request headers exceed {} bytes", MAX_HEADER_BYTES);
+                    return Framing::TooLarge;
+                }
+            };
+            self.stage = match body {
+                Ok(BodyKind::Length(body_len)) if body_len > MAX_BODY_BYTES => {
+                    log_error!("Request body of {} bytes exceeds {} bytes", body_len, MAX_BODY_BYTES);
+                    return Framing::TooLarge;
+                }
+                Ok(BodyKind::Length(body_len)) => Stage::Length(header_len + body_len),
+                Ok(BodyKind::Chunked) => Stage::Chunked { header_len, chunks: ChunkWalker::default() },
+                // The server answers another transfer coding with 501 without reading a body
+                Ok(BodyKind::None | BodyKind::OtherCoding) => Stage::Length(header_len),
+                // The parser is going to reject these headers (e.g. Transfer-Encoding alongside Content-Length), so
+                // hand everything over for it to answer with a 400, rather than waiting for a body that cannot be
+                // trusted to end where the headers say
+                Err(_) => return Framing::Complete(buf.len()),
+            };
         }
-    };
-    let head = String::from_utf8_lossy(&buf[..header_len]);
 
-    // Only the first Transfer-Encoding counts, as in the parser, which rejects one sent alongside a Content-Length
-    if header_value(&head, "Transfer-Encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
-        let framing = chunked_request_len(buf, header_len);
-        if matches!(framing, Framing::TooLarge) {
-            log_error!("Chunked request body exceeds {} bytes", MAX_BODY_BYTES);
+        match &mut self.stage {
+            Stage::Head => Framing::Incomplete,
+            Stage::Length(total) if buf.len() < *total => Framing::Incomplete,
+            Stage::Length(total) => Framing::Complete(*total),
+            Stage::Chunked { header_len, chunks } => {
+                let header_len = *header_len;
+                match chunks.advance(&buf[header_len..], |_| {}) {
+                    Ok(body_len) if body_len <= MAX_BODY_BYTES => Framing::Complete(header_len + body_len),
+                    // Hand everything over so the parser answers it with a 400, rather than waiting for bytes that will not help
+                    Err(ChunkError::Malformed) => Framing::Complete(buf.len()),
+                    Err(ChunkError::Incomplete) if buf.len() <= header_len + MAX_BODY_BYTES => Framing::Incomplete,
+                    // The limit applies to the body with its framing, which is all that is known before the end has arrived
+                    _ => {
+                        log_error!("Chunked request body exceeds {} bytes", MAX_BODY_BYTES);
+                        Framing::TooLarge
+                    }
+                }
+            }
         }
-        return framing;
-    }
-
-    let body_len = header_value(&head, "Content-Length").and_then(|value| value.parse().ok()).unwrap_or(0);
-    if body_len > MAX_BODY_BYTES {
-        log_error!("Request body of {} bytes exceeds {} bytes", body_len, MAX_BODY_BYTES);
-        return Framing::TooLarge;
-    }
-
-    let total = header_len + body_len;
-    if buf.len() < total {
-        Framing::Incomplete
-    } else {
-        Framing::Complete(total)
     }
 }
 
@@ -137,25 +144,94 @@ pub(crate) fn log_closed_early(received: usize) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn header_end_finds_crlf_and_bare_lf_blank_lines() {
-        assert_eq!(header_end(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nbody"), Some(27));
-        assert_eq!(header_end(b"GET / HTTP/1.1\nHost: a\n\nbody"), Some(24));
-        assert_eq!(header_end(b"GET / HTTP/1.1\r\nHost: a\r\n"), None);
-        assert_eq!(header_end(b""), None);
+    // Frames a request that has arrived all at once
+    fn request_len(buf: &[u8]) -> Framing {
+        Framer::default().advance(buf)
     }
 
     #[test]
-    fn header_end_needs_a_cr_before_a_crlf_blank_line() {
-        // An LF followed by CRLF is not a blank line in either style
-        assert_eq!(header_end(b"GET / HTTP/1.1\nHost: a\n\r\n"), None);
-        assert_eq!(header_end(b"\n\r\n"), None);
+    fn request_len_finds_crlf_and_bare_lf_blank_lines() {
+        assert!(matches!(request_len(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nbody"), Framing::Complete(27)));
+        assert!(matches!(request_len(b"GET / HTTP/1.1\nHost: a\n\nbody"), Framing::Complete(24)));
+        assert!(matches!(request_len(b"GET / HTTP/1.1\r\nHost: a\r\n"), Framing::Incomplete));
+        assert!(matches!(request_len(b""), Framing::Incomplete));
     }
 
     #[test]
-    fn header_end_stops_at_the_first_blank_line() {
+    fn request_len_ends_the_head_where_the_parser_does() {
+        // The parser takes a line ending in LF or CRLF, in any mix, so an LF line followed by a CRLF blank line ends the head
+        assert!(matches!(request_len(b"GET / HTTP/1.1\nHost: a\n\r\nbody"), Framing::Complete(25)));
+        // It also skips empty lines before the request line, so they do not end the head
+        assert!(matches!(request_len(b"\r\n\r\n"), Framing::Incomplete));
+        assert!(matches!(request_len(b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"), Framing::Complete(31)));
+    }
+
+    #[test]
+    fn request_len_stops_at_the_first_blank_line() {
         // A blank line inside the body must not move the end of the headers
-        assert_eq!(header_end(b"POST / HTTP/1.1\r\n\r\nline\n\nmore\r\n\r\n"), Some(19));
+        assert!(matches!(request_len(b"POST / HTTP/1.1\r\n\r\nline\n\nmore\r\n\r\n"), Framing::Complete(19)));
+    }
+
+    #[test]
+    fn request_len_hands_headers_the_parser_rejects_straight_to_it() {
+        // No body is waited for, since the parser answers these with a 400 whatever follows
+        let both = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello";
+        assert!(matches!(request_len(both), Framing::Complete(n) if n == both.len()));
+
+        let conflicting = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 50\r\n\r\n";
+        assert!(matches!(request_len(conflicting), Framing::Complete(n) if n == conflicting.len()));
+
+        let not_a_number = b"POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n";
+        assert!(matches!(request_len(not_a_number), Framing::Complete(n) if n == not_a_number.len()));
+    }
+
+    // Feeds request to one Framer in pieces of at most step bytes, as it would arrive over several receives
+    // Returns the framing once it is no longer incomplete, and how many bytes had arrived by then
+    fn frame_in_pieces(request: &[u8], step: usize) -> (Framing, usize) {
+        let mut framer = Framer::default();
+        let mut len = 0;
+        loop {
+            len = (len + step).min(request.len());
+            match framer.advance(&request[..len]) {
+                Framing::Incomplete if len < request.len() => {}
+                framing => return (framing, len),
+            }
+        }
+    }
+
+    #[test]
+    fn framer_keeps_its_place_between_receives() {
+        let requests: [&[u8]; 3] = [
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nTrailer: x\r\n\r\n",
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+            b"\r\nGET / HTTP/1.1\nHost: a\n\r\n",
+        ];
+        for request in requests {
+            for step in [1, 2, 3, 7] {
+                // Complete exactly when the last byte arrives, and not before
+                let (framing, arrived) = frame_in_pieces(request, step);
+                assert!(matches!(framing, Framing::Complete(n) if n == request.len()), "in pieces of {step}");
+                assert_eq!(arrived, request.len(), "in pieces of {step}");
+            }
+        }
+    }
+
+    // Walking the chunks again from the first one after every receive would take time that grows with the square of
+    // the body, which let one client sending tiny chunks in tiny pieces keep a worker busy for minutes
+    #[test]
+    fn framer_reads_each_chunk_of_a_body_of_tiny_chunks_once() {
+        let mut request = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let head_len = request.len();
+        while request.len() - head_len < MAX_BODY_BYTES - 64 {
+            request.extend_from_slice(b"1\r\na\r\n");
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+
+        let start = std::time::Instant::now();
+        let (framing, _) = frame_in_pieces(&request, 64);
+        assert!(matches!(framing, Framing::Complete(n) if n == request.len()));
+        // About 16,000 receives: milliseconds when each chunk is read once, and minutes when they are all read every time
+        assert!(start.elapsed() < Duration::from_secs(2), "framing took {:?}", start.elapsed());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows_sys::Win32::System::IO::{CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
-use super::{log_closed_early, request_len, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT};
+use super::{log_closed_early, Framer, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT, SEND_IDLE_TIMEOUT};
 use crate::ip_address::IpAddress;
 
 // Winsock 2.2
@@ -39,6 +39,11 @@ const ADDRESS_BYTES: u32 = mem::size_of::<SOCKADDR_IN>() as u32 + 16;
 
 // How much each recv reads at most, enough for a typical request with a small body in one call
 const RECV_BYTES: usize = 16 * 1024;
+
+// How much of a response each send hands to the kernel at most
+// A send only completes once the client has taken all of it, so one send of a whole large response would show no
+// progress until the very end, and a client downloading it slowly would look just like one that had stopped reading
+const SEND_BYTES: usize = 64 * 1024;
 
 // How often connections are checked for ones idle past IDLE_TIMEOUT, and the accept pool topped back up if it fell short
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -142,8 +147,9 @@ struct Connection<'a> {
     // Where AcceptEx writes the addresses
     addresses: [u8; 2 * ADDRESS_BYTES as usize],
     ip: IpAddress,
-    // The request received so far
+    // The request received so far, and how far along it is
     request: Vec<u8>,
+    framer: Framer,
     // Once the request is handled, the response and how much of it has been sent
     response: Option<(Cow<'a, [u8]>, usize)>,
 }
@@ -157,6 +163,7 @@ impl Connection<'_> {
             addresses: [0; 2 * ADDRESS_BYTES as usize],
             ip: IpAddress::from([0; 4]),
             request: Vec::new(),
+            framer: Framer::default(),
             response: None,
         })
     }
@@ -176,7 +183,7 @@ unsafe fn start_recv(conn: *mut Connection<'_>, transferred: &mut u32) -> i32 {
     WSARecv(conn.socket, &buf, 1, transferred, &mut flags, &mut conn.overlapped, None)
 }
 
-// Starts sending what is left of the response
+// Starts sending the next piece of what is left of the response, of at most SEND_BYTES
 // The only copy is the one send makes into the kernel's socket buffer
 // Returns the WSASend status, after which conn must not be touched unless the call finished immediately
 unsafe fn start_send(conn: *mut Connection<'_>, transferred: &mut u32) -> i32 {
@@ -187,7 +194,7 @@ unsafe fn start_send(conn: *mut Connection<'_>, transferred: &mut u32) -> i32 {
         Some((response, sent)) => &response[*sent..],
         None => &[],
     };
-    let buf = WSABUF { len: unsent.len().min(u32::MAX as usize) as u32, buf: unsent.as_ptr() as *mut u8 };
+    let buf = WSABUF { len: unsent.len().min(SEND_BYTES) as u32, buf: unsent.as_ptr() as *mut u8 };
     WSASend(conn.socket, &buf, 1, transferred, 0, &mut conn.overlapped, None)
 }
 
@@ -210,28 +217,31 @@ struct Shared<'l, 'a, C> {
     skip_completions: bool,
     // How many AcceptEx calls are outstanding
     accepts: AtomicUsize,
-    // Every accepted socket and when it last made progress, for the idle timeout
+    // Every accepted socket, when it last made progress, and whether it has a response to send, for the idle timeout
     // A socket is removed before it is closed, so holding the lock keeps every socket in here open
-    last_active: Mutex<HashMap<NativeSocket, Instant>>,
+    last_active: Mutex<HashMap<NativeSocket, (Instant, bool)>>,
 }
 
 impl<C> Shared<'_, '_, C> {
-    fn last_active(&self) -> MutexGuard<'_, HashMap<NativeSocket, Instant>> {
+    fn last_active(&self) -> MutexGuard<'_, HashMap<NativeSocket, (Instant, bool)>> {
         // Nothing panics while holding the lock, and the map is valid even if something did
         self.last_active.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn touch(&self, socket: NativeSocket) {
-        self.last_active().insert(socket, Instant::now());
+    // Notes that socket just made progress, and whether it now has a response to send
+    fn touch(&self, socket: NativeSocket, sending: bool) {
+        self.last_active().insert(socket, (Instant::now(), sending));
     }
 
-    // Cancels the outstanding operation of connections that have gone IDLE_TIMEOUT without making progress, and the
+    // Cancels the outstanding operation of connections that have gone too long without making progress, and the
     // worker that gets the cancelled completion closes them
+    // A client is allowed longer to take a response than to send a request, as on linux
     // Browsers open spare "preconnect" sockets they may never send a request on, so these are expected
     // A connection in its handler has nothing outstanding to cancel, and it is checked again on the next sweep
     fn close_idle(&self) {
-        for (&socket, last_active) in self.last_active().iter() {
-            if last_active.elapsed() >= IDLE_TIMEOUT {
+        for (&socket, &(last_active, sending)) in self.last_active().iter() {
+            let timeout = if sending { SEND_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
+            if last_active.elapsed() >= timeout {
                 unsafe { CancelIoEx(socket as HANDLE, ptr::null()) };
             }
         }
@@ -376,7 +386,7 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
         let ip = peer_address(&conn.addresses).unwrap_or(Ipv4Addr::UNSPECIFIED);
         log_info!("Connection from {}", ip);
         conn.ip = IpAddress::from(ip.octets());
-        self.shared.touch(conn.socket);
+        self.shared.touch(conn.socket, false);
         Next::Recv
     }
 
@@ -401,11 +411,11 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
         // The kernel initialized the first n bytes of the spare capacity
         unsafe { conn.request.set_len(len + n) };
 
-        let total = match request_len(&conn.request) {
+        let total = match conn.framer.advance(&conn.request) {
             Framing::Complete(total) => total,
             Framing::TooLarge => return Next::Close,
             Framing::Incomplete => {
-                self.shared.touch(conn.socket);
+                self.shared.touch(conn.socket, false);
                 return Next::Recv;
             }
         };
@@ -427,7 +437,7 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
         }
         conn.response = Some((response, 0));
         // The time spent in the handler is not the client being idle
-        self.shared.touch(conn.socket);
+        self.shared.touch(conn.socket, true);
         Next::Send
     }
 
@@ -443,9 +453,14 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
             Ok(n) => {
                 *sent += n as usize;
                 if *sent < response.len() {
-                    self.shared.touch(conn.socket);
+                    self.shared.touch(conn.socket, true);
                     return Next::Send;
                 }
+                Next::Close
+            }
+            // Cancelled by the idle sweep
+            Err(e) if e.raw_os_error() == Some(WSA_OPERATION_ABORTED) => {
+                log_info!("Closing connection that stopped reading after {} of {} bytes", sent, response.len());
                 Next::Close
             }
             Err(e) => {
@@ -461,6 +476,7 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
         close(conn.socket);
         if self.spare.is_none() && conn.request.capacity() <= RECV_BYTES {
             conn.request.clear();
+            conn.framer = Framer::default();
             conn.response = None;
             self.spare = Some(conn);
         }
@@ -572,7 +588,11 @@ impl<C: Sync> TcpListener<'_, C> {
             // The calling thread keeps the pool full, including filling it to start with, and sweeps for idle connections
             let mut sweeper = Worker { shared: &shared, spare: None };
             loop {
-                while shared.accepts.load(Ordering::Relaxed) < ACCEPT_POOL && sweeper.post_accept() {}
+                while shared.accepts.load(Ordering::Relaxed) < ACCEPT_POOL {
+                    if !sweeper.post_accept() {
+                        break;
+                    }
+                }
                 thread::sleep(SWEEP_INTERVAL);
                 shared.close_idle();
             }
