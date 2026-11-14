@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
-use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -12,15 +11,19 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Networking::WinSock::{
-    bind, closesocket, listen, socket, AcceptEx, GetAcceptExSockaddrs, WSAEnumProtocolsW, WSAGetLastError, WSARecv, WSASend,
-    WSASocketW, WSAStartup, AF_INET, INADDR_ANY, INVALID_SOCKET, IPPROTO_TCP, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR,
-    SOCK_STREAM, WSABUF, WSADATA, WSAENOBUFS, WSAPROTOCOL_INFOW, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
-    WSA_IO_PENDING, WSA_OPERATION_ABORTED, XP1_IFS_HANDLES,
+    bind, closesocket, ioctlsocket, listen, setsockopt, shutdown, socket, AcceptEx, GetAcceptExSockaddrs, WSAEnumProtocolsW,
+    WSAGetLastError, WSARecv, WSASend, WSASocketW, WSAStartup, AF_INET, FIONREAD, INADDR_ANY, INVALID_SOCKET, IPPROTO_TCP,
+    SD_SEND, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, WSABUF, WSADATA,
+    WSAENOBUFS, WSAPROTOCOL_INFOW, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSA_OPERATION_ABORTED,
+    XP1_IFS_HANDLES,
 };
 use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows_sys::Win32::System::IO::{CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
-use super::{log_closed_early, Framer, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT, SEND_IDLE_TIMEOUT};
+use super::{
+    log_closed_early, reserve_recv_room, AbortOnPanic, Framer, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT,
+    RECV_BYTES, SEND_IDLE_TIMEOUT,
+};
 use crate::ip_address::IpAddress;
 
 // Winsock 2.2
@@ -36,9 +39,6 @@ const ACCEPT_POOL: usize = 64;
 
 // The room AcceptEx needs for each of the local and remote addresses, which must be 16 bytes more than the address
 const ADDRESS_BYTES: u32 = mem::size_of::<SOCKADDR_IN>() as u32 + 16;
-
-// How much each recv reads at most, enough for a typical request with a small body in one call
-const RECV_BYTES: usize = 16 * 1024;
 
 // How much of a response each send hands to the kernel at most
 // A send only completes once the client has taken all of it, so one send of a whole large response would show no
@@ -83,6 +83,32 @@ fn startup() -> bool {
 
 fn close(conn: NativeSocket) {
     unsafe { closesocket(conn) };
+}
+
+// Whether the client has sent anything that has not been received yet
+// If the socket cannot say, it counts as nothing, and the connection is closed the way it always was
+fn has_unread(conn: NativeSocket) -> bool {
+    let mut bytes = 0u32;
+    unsafe { ioctlsocket(conn, FIONREAD, &mut bytes) == 0 && bytes > 0 }
+}
+
+// Tells the client the response ends here, while leaving the connection open to receive on
+// A socket from AcceptEx has to be given its listening socket's properties before shutdown works on it, which is
+// done here and not on every accept, since few connections need it
+fn shutdown_sending(conn: NativeSocket, listen_socket: NativeSocket) -> io::Result<()> {
+    let updated = unsafe {
+        setsockopt(
+            conn,
+            SOL_SOCKET,
+            SO_UPDATE_ACCEPT_CONTEXT,
+            &listen_socket as *const NativeSocket as *const u8,
+            mem::size_of::<NativeSocket>() as i32,
+        )
+    };
+    if updated == SOCKET_ERROR || unsafe { shutdown(conn, SD_SEND) } == SOCKET_ERROR {
+        return Err(last_wsa_error());
+    }
+    Ok(())
 }
 
 // Whether calls that finish immediately can safely skip their completion
@@ -135,6 +161,8 @@ enum Operation {
     Accept,
     Recv,
     Send,
+    // Receiving what the client sends after its request, only to discard it (see Worker::linger)
+    Drain,
 }
 
 // One connection, from the AcceptEx waiting for it until it is closed
@@ -154,6 +182,9 @@ struct Connection<'a> {
     framer: Framer,
     // Once the request is handled, the response and how much of it has been sent
     response: Option<(Cow<'a, [u8]>, usize)>,
+    // When the whole response had been sent and the connection started waiting for the client to close (see
+    // Worker::linger)
+    closing_since: Option<Instant>,
 }
 
 impl Connection<'_> {
@@ -167,18 +198,21 @@ impl Connection<'_> {
             request: Vec::new(),
             framer: Framer::default(),
             response: None,
+            closing_since: None,
         })
     }
 }
 
 // Starts receiving straight into the request's spare room, so there is no copy out of a separate chunk buffer
 // and no zeroing of memory the kernel is about to overwrite
+// operation is Recv for the request, or Drain for what follows it, which is discarded: the request buffer is empty
+// by then and stays empty, since its length is never moved on over what arrives
 // Returns the WSARecv status, after which conn must not be touched unless the call finished immediately
-unsafe fn start_recv(conn: *mut Connection<'_>, transferred: &mut u32) -> i32 {
+unsafe fn start_recv(conn: *mut Connection<'_>, operation: Operation, transferred: &mut u32) -> i32 {
     let conn = &mut *conn;
-    conn.operation = Operation::Recv;
+    conn.operation = operation;
     conn.overlapped = mem::zeroed();
-    conn.request.reserve(RECV_BYTES);
+    reserve_recv_room(&mut conn.request);
     let spare = conn.request.spare_capacity_mut();
     let buf = WSABUF { len: spare.len().min(u32::MAX as usize) as u32, buf: spare.as_mut_ptr().cast() };
     let mut flags = 0;
@@ -204,6 +238,7 @@ unsafe fn start_send(conn: *mut Connection<'_>, transferred: &mut u32) -> i32 {
 enum Next {
     Recv,
     Send,
+    Drain,
     Close,
 }
 
@@ -280,7 +315,8 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
     // Adds one AcceptEx to the pool, returning false if that failed
     // It always finishes through a completion, even when a connection is already waiting, since the skipping is only
     // turned on for connections and the listening socket does not have it
-    // No SO_UPDATE_ACCEPT_CONTEXT call follows it, as that only matters to calls like shutdown which aren't used here
+    // No SO_UPDATE_ACCEPT_CONTEXT call follows it, as that only matters to calls like shutdown, and the few
+    // connections that need one make it then (see shutdown_sending)
     fn post_accept(&mut self) -> bool {
         let socket = match self.open_socket() {
             Ok(socket) => socket,
@@ -343,6 +379,7 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
                 Operation::Accept => self.accepted(&mut conn, result),
                 Operation::Recv => self.received(&mut conn, result),
                 Operation::Send => self.sent(&mut conn, result),
+                Operation::Drain => self.drained(&mut conn, result),
             };
 
             // Ownership passes to the kernel before the call, since another worker can have the completion before
@@ -350,7 +387,8 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
             let raw = Box::into_raw(conn);
             let mut transferred = 0;
             let status = match next {
-                Next::Recv => unsafe { start_recv(raw, &mut transferred) },
+                Next::Recv => unsafe { start_recv(raw, Operation::Recv, &mut transferred) },
+                Next::Drain => unsafe { start_recv(raw, Operation::Drain, &mut transferred) },
                 Next::Send => unsafe { start_send(raw, &mut transferred) },
                 Next::Close => {
                     self.finish(unsafe { Box::from_raw(raw) });
@@ -421,22 +459,9 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
                 return Next::Recv;
             }
         };
-        // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
-        conn.request.truncate(total);
-
-        // A handler that panics only takes down its own connection, not the worker serving many others
-        let listener = self.shared.listener;
-        let handled = panic::catch_unwind(AssertUnwindSafe(|| (listener.handler)(listener.context, &conn.request, conn.ip)));
-        let Ok(response) = handled else {
-            log_error!("The request handler panicked");
+        let Some(response) = self.shared.listener.handle(&mut conn.request, total, conn.ip) else {
             return Next::Close;
         };
-        // The buffer is kept for the next connection, unless an unusually large request grew it
-        if conn.request.capacity() > RECV_BYTES {
-            conn.request = Vec::new();
-        } else {
-            conn.request.clear();
-        }
         // Sending nothing would complete with no bytes sent, which is otherwise a failed send
         if response.is_empty() {
             return Next::Close;
@@ -462,7 +487,7 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
                     self.shared.touch(conn.socket, true);
                     return Next::Send;
                 }
-                Next::Close
+                self.linger(conn)
             }
             // Cancelled by the idle sweep
             Err(e) if e.raw_os_error() == Some(WSA_OPERATION_ABORTED) => {
@@ -476,6 +501,52 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
         }
     }
 
+    // Decides what to do once the whole response has been handed to the kernel
+    // A send completes when the response is in the socket's buffer, not when the client has it, and closing a
+    // socket while the client has sent something that was never read (a pipelined request, a line ending after a
+    // body) resets the connection and throws away whatever is still in that buffer
+    // So if anything is unread, the client is told the response ends here and the connection stays open, discarding
+    // what the client sends, until the client closes its end or SEND_IDLE_TIMEOUT passes
+    // Otherwise it is closed straight away, which is nearly every connection
+    fn linger(&mut self, conn: &mut Connection<'a>) -> Next {
+        if !has_unread(conn.socket) {
+            return Next::Close;
+        }
+        if let Err(e) = shutdown_sending(conn.socket, self.shared.listener.socket) {
+            log_error!("shutdown: {}", e);
+            return Next::Close;
+        }
+        // The kernel has its own copy of what is left to send
+        conn.response = None;
+        conn.closing_since = Some(Instant::now());
+        // The sweep allows it as long from here as it allows for a piece of the response
+        self.shared.touch(conn.socket, true);
+        Next::Drain
+    }
+
+    // Some of what the client sent after its request was received, and is discarded
+    fn drained(&mut self, conn: &mut Connection<'a>, result: io::Result<u32>) -> Next {
+        match result {
+            // The client has closed its end, so nothing more can arrive to go unread, and closing from here on
+            // sends the rest of the response as usual
+            Ok(0) => Next::Close,
+            // Nothing the client sends counts as progress, so one that sends without stopping is closed here, where
+            // the sweep would rarely find a receive outstanding to cancel
+            Ok(_) if conn.closing_since.is_some_and(|since| since.elapsed() < SEND_IDLE_TIMEOUT) => Next::Drain,
+            Ok(_) => {
+                log_info!("Closing connection that had not closed {:?} after the end of its response", SEND_IDLE_TIMEOUT);
+                Next::Close
+            }
+            // Cancelled by the idle sweep
+            Err(e) if e.raw_os_error() == Some(WSA_OPERATION_ABORTED) => {
+                log_info!("Closing connection that had not closed {:?} after the end of its response", SEND_IDLE_TIMEOUT);
+                Next::Close
+            }
+            // The client reset the connection, or something else that leaves nothing more to wait for
+            Err(_) => Next::Close,
+        }
+    }
+
     // Closes a finished connection, keeping it to reuse for the next accept if there isn't one kept already
     fn finish(&mut self, mut conn: Box<Connection<'a>>) {
         self.shared.last_active().remove(&conn.socket);
@@ -484,6 +555,7 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
             conn.request.clear();
             conn.framer = Framer::default();
             conn.response = None;
+            conn.closing_since = None;
             self.spare = Some(conn);
         }
     }
@@ -586,9 +658,15 @@ impl<C: Sync> TcpListener<'_, C> {
         let workers = 2 * thread::available_parallelism().map_or(4, |n| n.get());
 
         // Scoped threads can borrow self (and the context) since they are all joined before run returns
+        // A panic in any of them, or in this one, ends the process: the scope would otherwise wait forever for the
+        // threads that are left, with the port still open
+        let _abort = AbortOnPanic;
         thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| Worker { shared: &shared, spare: None }.run());
+                scope.spawn(|| {
+                    let _abort = AbortOnPanic;
+                    Worker { shared: &shared, spare: None }.run()
+                });
             }
 
             // The calling thread keeps the pool full, including filling it to start with, and sweeps for idle connections

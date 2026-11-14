@@ -304,11 +304,7 @@ fn request_sent_in_two_writes_is_not_held_up_by_a_delayed_ack() {
 fn slow_handlers_do_not_hold_up_an_open_connection() {
     let port = 38114;
     thread::spawn(move || {
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(libc::sched_getcpu() as usize, &mut set);
-            assert_eq!(libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set), 0);
-        }
+        pin_to_current_cpu();
         let mut s = Server::new(());
         s.add_endpoint(Method::Post, "/echo", |request: &HttpRequest, _state: &()| -> HttpResponse {
             HttpResponseBuilder::from_text(Status::Ok, request.content()).build()
@@ -356,13 +352,7 @@ fn slow_handlers_do_not_hold_up_an_open_connection() {
 fn large_response_survives_a_client_pause() {
     const BODY_BYTES: usize = 64 * 1024 * 1024;
     let port = 38115;
-    thread::spawn(move || {
-        let mut s = Server::new(());
-        s.add_endpoint(Method::Get, "/large", |_request: &HttpRequest, _state: &()| -> HttpResponse {
-            HttpResponseBuilder::from_text(Status::Ok, "a".repeat(BODY_BYTES)).build()
-        });
-        s.run(port);
-    });
+    start_large_server(port, BODY_BYTES);
 
     let mut stream = connect(port);
     stream.write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
@@ -370,8 +360,7 @@ fn large_response_survives_a_client_pause() {
     thread::sleep(Duration::from_secs(7));
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
-    let body_start = response.windows(4).position(|w| w == b"\r\n\r\n").expect("response has no end of headers") + 4;
-    assert_eq!(response.len() - body_start, BODY_BYTES);
+    assert_eq!(body_len(&response), BODY_BYTES);
 }
 
 // Headers past the limit are refused even when they all arrive in the first receive
@@ -507,10 +496,9 @@ fn head_is_framed_the_way_the_parser_reads_it() {
     assert!(start.elapsed() < Duration::from_secs(2), "the response took {:?}", start.elapsed());
 }
 
-// Closing a connection with client data still unread resets it, which must not take the response with it
+// Closing a connection with client data still unread resets it, which must not take the response with it, so the
+// server takes what the client sends until the client has the response, and the client never sees a reset
 // The extra bytes stand in for anything a client sends past its request, like a pipelined request
-// Only on linux, where a client keeps what it had already received when the reset arrives
-#[cfg(target_os = "linux")]
 #[test]
 fn response_is_sent_before_a_close_with_unread_data() {
     let port = 38124;
@@ -523,11 +511,9 @@ fn response_is_sent_before_a_close_with_unread_data() {
         request.resize(request.len() + 64 * 1024, b'a');
 
         let mut stream = connect(port);
-        // The server may reset the connection before taking all of this
-        let _ = stream.write_all(&request);
-        // Read up to the reset, which read_to_end reports after handing over what arrived before it
+        stream.write_all(&request).expect("the connection was reset before the server had taken the request");
         let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
+        stream.read_to_end(&mut response).expect("the connection was reset where the response should have ended");
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
         assert!(response.ends_with("\r\n\r\nindex"), "response: {response:?}");
@@ -542,11 +528,7 @@ fn response_is_sent_before_a_close_with_unread_data() {
 fn requests_waiting_for_a_worker_are_not_closed_as_idle() {
     let port = 38125;
     thread::spawn(move || {
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(libc::sched_getcpu() as usize, &mut set);
-            assert_eq!(libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set), 0);
-        }
+        pin_to_current_cpu();
         let mut s = Server::new(());
         s.add_endpoint(Method::Get, "/slow", |_request: &HttpRequest, _state: &()| -> HttpResponse {
             thread::sleep(Duration::from_millis(2500));
@@ -634,7 +616,6 @@ fn client_that_stops_reading_is_closed() {
 // Closing a connection with client data still unread resets it, and a reset discards what has not gone out yet, so
 // a response too large to go out at once must not be closed until the client has it
 // The extra bytes stand in for anything a client sends past its request: a line ending after it, or a pipelined request
-#[cfg(target_os = "linux")]
 #[test]
 fn large_response_arrives_whole_with_unread_data() {
     const BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -661,17 +642,57 @@ fn large_response_arrives_whole_with_unread_data() {
     }
 }
 
+// What a client sends while the end of its response waits to go out is discarded, and is no sign of it taking the
+// response, so a client that takes none of it is still closed however much it sends
+// Only on linux, where the listener keeps receiving once the response is in the kernel's buffer: on Windows a
+// response this size is still being sent, and nothing is received meanwhile
+#[cfg(target_os = "linux")]
+#[test]
+fn client_that_floods_while_its_response_lingers_is_closed() {
+    // Small enough for the kernel to take all of it at once, and too large to all go out to a client that reads none
+    const BODY_BYTES: usize = 1024 * 1024;
+    let port = 38131;
+    start_large_server(port, BODY_BYTES);
+
+    let mut stream = connect(port);
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+
+    // Without a pause, so the server's socket always has something waiting to be read
+    let junk = [b'a'; 16 * 1024];
+    let start = Instant::now();
+    let closed = loop {
+        match stream.write_all(&junk) {
+            Ok(()) if start.elapsed() < Duration::from_secs(45) => {}
+            Ok(()) => break false,
+            // The server no longer taking what is sent is not the server closing
+            Err(e) => break !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+        }
+    };
+    // The 30 second send timeout, and some room for a busy machine
+    assert!(closed, "the connection was still open after {:?}", start.elapsed());
+    assert!(start.elapsed() >= Duration::from_secs(25), "closed after only {:?}", start.elapsed());
+}
+
+// Keeps the calling thread on the CPU it is running on
+// A server started from it then gets the fewest workers the listener ever runs: one pinned to that CPU, and four
+// that serve parked connections
+#[cfg(target_os = "linux")]
+fn pin_to_current_cpu() {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(libc::sched_getcpu() as usize, &mut set);
+        assert_eq!(libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set), 0);
+    }
+}
+
 // Starts a server pinned to one CPU, which gets the fewest workers the listener ever runs: one pinned to that CPU,
 // and four that serve parked connections
 // Its /slow takes a second to answer
 #[cfg(target_os = "linux")]
 fn start_pinned_server(port: i32) {
     thread::spawn(move || {
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(libc::sched_getcpu() as usize, &mut set);
-            assert_eq!(libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set), 0);
-        }
+        pin_to_current_cpu();
         let mut s = Server::new(());
         s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, _state: &()| -> HttpResponse {
             HttpResponseBuilder::from_text(Status::Ok, "index").build()

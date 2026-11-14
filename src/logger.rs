@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +59,11 @@ impl Logger {
     pub fn log(&self, level: Level, args: fmt::Arguments<'_>) {
         match self.output() {
             Output::None => {}
-            Output::Stdout => println!("[{level}] {args}"),
+            // Not println!, which panics when stdout cannot be written to (a pipe whose reader has gone, a full
+            // disk), and a lost log line is no reason to take down the thread that logged it
+            Output::Stdout => {
+                let _ = writeln!(io::stdout(), "[{level}] {args}");
+            }
         }
     }
 }

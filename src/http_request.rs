@@ -143,10 +143,24 @@ fn next_line_bytes<'a>(request: &mut &'a [u8]) -> Result<&'a [u8], ParseError> {
 // The length of the head: any empty lines before the request line, the request line, and the headers through the
 // empty line that ends them, split into lines the same way as next_line
 pub(crate) fn head_len(request: &[u8]) -> Result<usize, ParseError> {
+    walk_head(request, |_| {}).ok_or(ParseError::MissingLineEnding)
+}
+
+// Walks the lines of a request's head, passing each header line to on_header, and returns the head's length
+// None if the head has not all arrived
+// The one place the head's lines are counted, so head_len and scan_head cannot disagree about where it ends
+fn walk_head(request: &[u8], mut on_header: impl FnMut(&[u8])) -> Option<usize> {
     let mut rest = request;
-    while next_line_bytes(&mut rest)?.is_empty() {}
-    while !next_line_bytes(&mut rest)?.is_empty() {}
-    Ok(request.len() - rest.len())
+    // Empty lines before the request line, and then the request line itself
+    while next_line_bytes(&mut rest).ok()?.is_empty() {}
+
+    loop {
+        let line = next_line_bytes(&mut rest).ok()?;
+        if line.is_empty() {
+            return Some(request.len() - rest.len());
+        }
+        on_header(line);
+    }
 }
 
 // Returns what follows the scheme of an absolute-form target
@@ -420,21 +434,13 @@ impl BodyHeaders {
 // Lines are split and headers read the same way as in Head::parse, and anything else the parser objects to is left
 // for it to find
 pub(crate) fn scan_head(request: &[u8]) -> Option<(usize, Result<BodyKind, ParseError>)> {
-    let mut rest = request;
-    // Empty lines before the request line, and then the request line itself
-    while next_line_bytes(&mut rest).ok()?.is_empty() {}
-
     let mut body = BodyHeaders::default();
-    loop {
-        let line = next_line_bytes(&mut rest).ok()?;
-        if line.is_empty() {
-            break;
-        }
+    let head_len = walk_head(request, |line| {
         if let Some(colon) = line.iter().position(|&b| b == b':') {
             body.observe(&line[..colon], trim_bytes(&line[colon + 1..]));
         }
-    }
-    Some((request.len() - rest.len(), body.kind()))
+    })?;
+    Some((head_len, body.kind()))
 }
 
 // Bytes as text, borrowed when they are valid UTF-8 and with invalid sequences replaced otherwise

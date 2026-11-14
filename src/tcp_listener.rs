@@ -48,6 +48,60 @@ pub(crate) const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+// How much each recv reads at most, enough for a typical request with a small body in one call
+// A receive buffer no larger than this is kept for the next connection
+pub(crate) const RECV_BYTES: usize = 16 * 1024;
+
+// The least spare room a receive is given
+// A buffer with this much left is received into as it is, since growing it would copy what has arrived and leave it
+// too large to keep for the next connection
+const MIN_RECV_ROOM: usize = 4 * 1024;
+
+// Makes sure request has room to receive into, growing it by RECV_BYTES only once it is nearly full
+// A small request that arrives in more than one piece therefore stays in the buffer it started in
+pub(crate) fn reserve_recv_room(request: &mut Vec<u8>) {
+    if request.capacity() - request.len() < MIN_RECV_ROOM {
+        request.reserve(RECV_BYTES);
+    }
+}
+
+// Ends the process if the thread holding it panics
+// Only a handler's panic is caught (see TcpListener::handle), so a panic anywhere else would end its thread for
+// good while run carries on without it: a worker that no longer accepts, or no rescue thread and no idle sweep
+// A server left holding its port but answering nothing is worse than one that stops and can be restarted
+pub(crate) struct AbortOnPanic;
+
+impl Drop for AbortOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            log_error!("A listener thread panicked outside a request handler, so the server is stopping");
+            std::process::abort();
+        }
+    }
+}
+
+impl<'a, C> TcpListener<'a, C> {
+    // Runs the handler on the complete request at the front of request, which is its first total bytes, and returns
+    // the response, or None if the handler panicked
+    // request is left empty, ready to be kept for the next connection, unless an unusually large request grew it
+    pub(crate) fn handle(&self, request: &mut Vec<u8>, total: usize, ip: IpAddress) -> Option<Cow<'a, [u8]>> {
+        // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
+        request.truncate(total);
+
+        // A handler that panics only takes down its own connection, not the worker serving many others
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.handler)(self.context, request, ip)));
+        if request.capacity() > RECV_BYTES {
+            *request = Vec::new();
+        } else {
+            request.clear();
+        }
+        if handled.is_err() {
+            log_error!("The request handler panicked");
+        }
+        handled.ok()
+    }
+}
+
 // How far along the request in a connection's receive buffer is
 pub(crate) enum Framing {
     // More bytes are needed
@@ -76,6 +130,7 @@ enum Stage {
 // request arrives in
 // Shared by the Windows and linux listeners so both apply the same limits, and it reads the head with the parser's
 // own scan (scan_head), so the two cannot disagree about where a request ends or whether it is valid
+// The server then splits the head off with head_len, which is the same walk over the lines (walk_head)
 #[derive(Default)]
 pub(crate) struct Framer {
     stage: Stage,
@@ -164,6 +219,27 @@ mod tests {
         // It also skips empty lines before the request line, so they do not end the head
         assert!(matches!(request_len(b"\r\n\r\n"), Framing::Incomplete));
         assert!(matches!(request_len(b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"), Framing::Complete(31)));
+    }
+
+    // The server splits the head off the request the listener framed, so both have to end it at the same byte
+    #[test]
+    fn head_len_ends_the_head_where_the_framer_does() {
+        use crate::http_request::head_len;
+        let requests: [&[u8]; 5] = [
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nbody",
+            b"GET / HTTP/1.1\nHost: a\n\r\nbody",
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            b"POST / HTTP/1.1\r\n\r\nline\n\nmore\r\n\r\n",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello",
+        ];
+        for request in requests {
+            let (framed, _) = scan_head(request).expect("the head is complete");
+            assert_eq!(head_len(request).ok(), Some(framed));
+        }
+        for unfinished in [&b""[..], b"\r\n\r\n", b"GET / HTTP/1.1\r\nHost: a\r\n"] {
+            assert!(scan_head(unfinished).is_none());
+            assert!(head_len(unfinished).is_err());
+        }
     }
 
     #[test]
@@ -278,6 +354,26 @@ mod tests {
         let mut request = head.clone();
         request.extend_from_slice(b"3\r\nabc\r");
         assert!(matches!(request_len(&request), Framing::Incomplete));
+    }
+
+    // Growing the buffer for every receive doubled it on a request's second receive, however small the request,
+    // which also left it too large to keep for the next connection
+    #[test]
+    fn receive_buffer_only_grows_once_it_is_nearly_full() {
+        let mut request = Vec::new();
+        reserve_recv_room(&mut request);
+        let capacity = request.capacity();
+        assert!(capacity >= RECV_BYTES);
+
+        // A request whose first piece has arrived, with plenty of room left for the rest
+        request.resize(capacity - MIN_RECV_ROOM, b'a');
+        reserve_recv_room(&mut request);
+        assert_eq!(request.capacity(), capacity);
+
+        // Nearly full, so the next receive would otherwise be a small one
+        request.push(b'a');
+        reserve_recv_room(&mut request);
+        assert!(request.capacity() - request.len() >= RECV_BYTES);
     }
 
     #[test]

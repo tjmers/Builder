@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::io;
 use std::mem::{self, MaybeUninit};
 use std::net::Ipv4Addr;
-use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
@@ -11,16 +10,16 @@ use std::time::{Duration, Instant};
 
 use libc::{c_int, c_void, epoll_event, sockaddr, sockaddr_in, socklen_t};
 
-use super::{log_closed_early, Framer, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT, SEND_IDLE_TIMEOUT};
+use super::{
+    log_closed_early, reserve_recv_room, AbortOnPanic, Framer, Framing, NativeSocket, RawRequestHandler, TcpListener, IDLE_TIMEOUT,
+    RECV_BYTES, SEND_IDLE_TIMEOUT,
+};
 use crate::ip_address::IpAddress;
 
 const INVALID_SOCKET: NativeSocket = -1;
 
 // The fewest threads serving parked connections, however few CPUs there are, so a few slow handlers cannot take up all of them
 const MIN_PARKED_WORKERS: usize = 4;
-
-// How much each recv reads at most, enough for a typical request with a small body in one call
-const RECV_BYTES: usize = 16 * 1024;
 
 // How often parked connections are checked for ones that have gone idle
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -99,6 +98,11 @@ fn unacked(conn: NativeSocket) -> Option<usize> {
 // How many of the bytes handed to send have not gone out to the client at all yet
 fn unsent(conn: NativeSocket) -> Option<usize> {
     queued_bytes(conn, libc::SIOCOUTQNSD as _)
+}
+
+// How many bytes the client has sent that have not been received yet (SIOCINQ, which is FIONREAD by another name)
+fn unread(conn: NativeSocket) -> Option<usize> {
+    queued_bytes(conn, libc::FIONREAD)
 }
 
 // Sets an int socket option
@@ -247,8 +251,11 @@ struct Connection<'a> {
     request: Vec<u8>,
     framer: Framer,
     // Once the request is handled, the response and how much of it has been sent
+    // The response itself is let go once the kernel has all of it (see finish)
     response: Option<(Cow<'a, [u8]>, usize)>,
-    // How much of the response the client had acknowledged at the last sweep
+    // The length of the response, once there is one, which outlasts the response itself
+    response_len: Option<usize>,
+    // How much of the response the client had acknowledged when it was last checked
     acked: usize,
     // Whether the whole response has been handed to the kernel and the connection is only waiting for the client to
     // take the end of it (see finish)
@@ -275,6 +282,7 @@ impl<'a> Connection<'a> {
             request,
             framer: Framer::default(),
             response: None,
+            response_len: None,
             acked: 0,
             closing: false,
             interest: Interest::None,
@@ -294,7 +302,7 @@ impl<'a> Connection<'a> {
             // Receive straight into the request's spare room, so there is no copy out of a separate chunk buffer
             // and no zeroing of memory the kernel is about to overwrite
             let len = self.request.len();
-            self.request.reserve(RECV_BYTES);
+            reserve_recv_room(&mut self.request);
             let received = recv(fd, self.request.spare_capacity_mut());
             if let Ok(n) = received {
                 // The kernel initialized the first n bytes of the spare capacity
@@ -346,25 +354,35 @@ impl<'a> Connection<'a> {
     // Decides what to do once the whole response is in the kernel's send buffer
     // Closing a connection while the client has sent something that was never read (a pipelined request, a line
     // ending after a body) resets it, and a reset throws away whatever part of the response has not gone out yet
-    // A response that has all gone out is safe from that, so the connection is closed straight away, which is every
-    // response small enough to go out at once
+    // It also stops the kernel sending again anything that was lost on the way, and a client that discards what it
+    // has not read when a reset arrives loses that too
+    // So the connection is only closed straight away when the response has all gone out and nothing from the client
+    // is unread, which is nearly every connection
     // Otherwise the client is told the response ends here, and the connection stays open, discarding whatever the
     // client sends, until the client has all of it
     fn finish(&mut self, fd: NativeSocket) -> Next {
-        // If the kernel cannot say, close as if it had all gone out, which is what closing always did before
-        if unsent(fd).unwrap_or(0) == 0 {
+        // If the kernel cannot say, close as if there were nothing, which is what closing always did before
+        if unsent(fd).unwrap_or(0) == 0 && unread(fd).unwrap_or(0) == 0 {
             return Next::Close;
         }
         unsafe { libc::shutdown(fd, libc::SHUT_WR) };
         self.closing = true;
+        // The kernel has its own copy of what is left to send, so a large response is not held on to while a slow
+        // client takes the end of it
+        self.response = None;
         self.drain(fd)
     }
 
     // Discards what the client has sent since its request, so that closing cannot reset the connection, and closes
     // once the client has the whole response or has closed its own end
-    // None of this counts as progress, so a client that keeps sending but takes none of the response is still closed
-    // by the sweep
+    // Nothing the client sends counts as progress, only what it acknowledges, and that is checked here as well as
+    // by the sweep: a client that sends without stopping keeps the connection out of the map, where the sweep
+    // would rarely find it
     fn drain(&mut self, fd: NativeSocket) -> Next {
+        if self.stopped_taking(fd) {
+            self.log_stopped_reading();
+            return Next::Close;
+        }
         let mut discarded = [MaybeUninit::<u8>::uninit(); RECV_BYTES];
         for _ in 0..DRAIN_RECVS {
             match recv(fd, &mut discarded) {
@@ -386,27 +404,57 @@ impl<'a> Connection<'a> {
 
     // Whether it has gone too long without progress, allowing longer for a client to take a response than to send a request
     fn is_idle(&self) -> bool {
-        let timeout = if self.response.is_some() { SEND_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
+        let timeout = if self.response_len.is_some() { SEND_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
         self.last_active.elapsed() >= timeout
+    }
+
+    // How much of the response has been handed to the kernel
+    fn sent(&self) -> usize {
+        match &self.response {
+            Some((_, sent)) => *sent,
+            // Either there is no response yet or all of it was sent (see finish)
+            None => self.response_len.unwrap_or(0),
+        }
+    }
+
+    // Counts whatever the client has acknowledged since the last check as progress, and returns how much it has
+    // yet to acknowledge, or None if there is no response or the kernel could not say
+    // A client taking its response slowly leaves the socket not ready to send for a long time at a stretch, so
+    // its progress is what it has acknowledged, not what the socket has had room for
+    fn note_acked(&mut self, fd: NativeSocket) -> Option<usize> {
+        self.response_len?;
+        let unacked = unacked(fd)?;
+        let acked = self.sent().saturating_sub(unacked);
+        if acked > self.acked {
+            self.acked = acked;
+            self.last_active = Instant::now();
+        }
+        Some(unacked)
+    }
+
+    // Whether the client has gone too long without acknowledging any more of its response
+    fn stopped_taking(&mut self, fd: NativeSocket) -> bool {
+        self.note_acked(fd);
+        self.is_idle()
+    }
+
+    // Logs that the connection is being closed on a client that stopped taking its response
+    fn log_stopped_reading(&self) {
+        if let Some(len) = self.response_len {
+            log_info!("Closing connection that stopped reading after {} of {} bytes", self.acked, len);
+        }
     }
 
     // Whether the sweep should close it, while it is parked: it is finished, or the client has stopped
     fn expired(&mut self, fd: NativeSocket) -> bool {
-        if let (Some((_, sent)), Some(unacked)) = (&self.response, unacked(fd)) {
-            // A client taking its response slowly leaves the socket not ready to send for a long time at a stretch,
-            // so its progress is what it has acknowledged, not what the socket has had room for
-            let acked = sent.saturating_sub(unacked);
-            if acked > self.acked {
-                self.acked = acked;
-                self.last_active = Instant::now();
-            }
-            if self.closing && unacked == 0 {
-                return true;
-            }
+        if self.note_acked(fd) == Some(0) && self.closing {
+            return true;
         }
         // One whose socket is ready is not idle: the client has done its part, and it is waiting for a parked
         // worker to come free, as it would have waited in the kernel's queue for accept
-        self.is_idle() && !is_ready(fd, self.interest)
+        // Not one that is closing, though, which is ready whenever the client has sent something more to discard,
+        // and that is no sign of it taking its response
+        self.is_idle() && (self.closing || !is_ready(fd, self.interest))
     }
 }
 
@@ -483,21 +531,10 @@ impl<'a, C> TcpListener<'a, C> {
                 Ok(None) => return Next::Wait(Interest::Read),
                 Err(()) => return Next::Close,
             };
-            // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
-            conn.request.truncate(total);
-
-            // A handler that panics only takes down its own connection, not the worker serving many others
-            let handled = panic::catch_unwind(AssertUnwindSafe(|| (self.handler)(self.context, &conn.request, conn.ip)));
-            let Ok(response) = handled else {
-                log_error!("The request handler panicked");
+            let Some(response) = self.handle(&mut conn.request, total, conn.ip) else {
                 return Next::Close;
             };
-            // The buffer is kept for the next connection, unless an unusually large request grew it
-            if conn.request.capacity() > RECV_BYTES {
-                conn.request = Vec::new();
-            } else {
-                conn.request.clear();
-            }
+            conn.response_len = Some(response.len());
             conn.response = Some((response, 0));
         }
 
@@ -593,10 +630,8 @@ impl<'a, C> Shared<'_, 'a, C> {
         // its event finds nothing in the map
         let expired: Vec<_> = self.parked().extract_if(|&fd, conn| conn.expired(fd)).collect();
         for (fd, conn) in expired {
-            match &conn.response {
-                Some((response, _)) if conn.acked < response.len() => {
-                    log_info!("Closing connection that stopped reading after {} of {} bytes", conn.acked, response.len());
-                }
+            match conn.response_len {
+                Some(len) if conn.acked < len => conn.log_stopped_reading(),
                 // The client has the whole response
                 Some(_) => {}
                 None => log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, conn.request.len()),
@@ -890,9 +925,13 @@ impl<C: Sync> TcpListener<'_, C> {
         let parked_workers = sockets.len().max(MIN_PARKED_WORKERS);
 
         // Scoped threads can borrow self (and the context), since run never returns while they are running
+        // A panic in any of them, or in this one, ends the process: the scope would otherwise wait forever for the
+        // threads that are left, with the port still open
+        let _abort = AbortOnPanic;
         thread::scope(|scope| {
             for (&(listen_socket, cpu), progress) in sockets.iter().zip(&progress) {
                 scope.spawn(move || {
+                    let _abort = AbortOnPanic;
                     if let Some(cpu) = cpu {
                         if let Err(e) = pin_to_cpu(cpu) {
                             log_error!("Failed to pin the worker for CPU {}: {}", cpu, e);
@@ -902,7 +941,10 @@ impl<C: Sync> TcpListener<'_, C> {
                 });
             }
             for _ in 0..parked_workers {
-                scope.spawn(move || Worker { shared, spare: Vec::new() }.serve_parked());
+                scope.spawn(move || {
+                    let _abort = AbortOnPanic;
+                    Worker { shared, spare: Vec::new() }.serve_parked()
+                });
             }
 
             // The calling thread takes over from stalled workers and sweeps for idle connections
