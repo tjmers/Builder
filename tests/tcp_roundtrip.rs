@@ -49,7 +49,7 @@ fn send(port: i32, raw: &[u8]) -> String {
 
 #[test]
 fn get_returns_200() {
-    let port = 38101;
+    let port = 28101;
     start_server(port);
     let response = send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n");
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
@@ -58,7 +58,7 @@ fn get_returns_200() {
 
 #[test]
 fn unknown_path_returns_404() {
-    let port = 38102;
+    let port = 28102;
     start_server(port);
     let response = send(port, b"GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"), "response: {response:?}");
@@ -66,7 +66,7 @@ fn unknown_path_returns_404() {
 
 #[test]
 fn body_is_read_using_content_length() {
-    let port = 38103;
+    let port = 28103;
     start_server(port);
     let response = send(port, b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response:?}");
@@ -75,7 +75,7 @@ fn body_is_read_using_content_length() {
 
 #[test]
 fn request_split_across_writes_is_reassembled() {
-    let port = 38104;
+    let port = 28104;
     start_server(port);
     let mut stream = None;
     for _ in 0..50 {
@@ -103,7 +103,7 @@ fn request_split_across_writes_is_reassembled() {
 // One of those sitting idle must not stop other connections from being served
 #[test]
 fn idle_connection_does_not_block_other_requests() {
-    let port = 38105;
+    let port = 28105;
     start_server(port);
     // Warm up so the server is listening before the idle socket connects
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -118,7 +118,7 @@ fn idle_connection_does_not_block_other_requests() {
 
 #[test]
 fn response_says_connection_is_closed() {
-    let port = 38106;
+    let port = 28106;
     start_server(port);
     let response = send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.contains("\r\nConnection: close\r\n"), "response: {response:?}");
@@ -128,7 +128,7 @@ fn response_says_connection_is_closed() {
 // Opening more of them than there are cores would stall the server if they did
 #[test]
 fn more_idle_connections_than_cores_do_not_block_other_requests() {
-    let port = 38107;
+    let port = 28107;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -152,7 +152,7 @@ fn more_idle_connections_than_cores_do_not_block_other_requests() {
 // Panicking on more connections than there are workers would leave nothing to serve the last request if it didn't
 #[test]
 fn panicking_handler_does_not_stop_the_server() {
-    let port = 38110;
+    let port = 28110;
     thread::spawn(move || {
         let mut s = Server::new(());
         s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, _state: &()| -> HttpResponse {
@@ -184,7 +184,7 @@ fn panicking_handler_does_not_stop_the_server() {
 // around the event loop, and every byte still has to arrive in order
 #[test]
 fn large_request_and_response_arrive_whole() {
-    let port = 38111;
+    let port = 28111;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -207,7 +207,7 @@ fn large_request_and_response_arrive_whole() {
 // A connection that never sends a request is eventually closed by the server
 #[test]
 fn idle_connection_is_closed_after_timeout() {
-    let port = 38108;
+    let port = 28108;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -222,7 +222,7 @@ fn idle_connection_is_closed_after_timeout() {
 // Workers share the port through SO_REUSEPORT, which must not let a second server quietly join one already running
 #[test]
 fn second_server_cannot_bind_a_port_in_use() {
-    let port = 38109;
+    let port = 28109;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -256,7 +256,7 @@ fn second_of_two_servers_bound_together_fails_to_run() {
         std::borrow::Cow::Borrowed(b"")
     }
 
-    let port = 38112;
+    let port = 28112;
     let mut first = TcpListener::new(&(), handler);
     let mut second = TcpListener::new(&(), handler);
     assert!(first.bind(port), "the first listener could not bind");
@@ -276,7 +276,7 @@ fn second_of_two_servers_bound_together_fails_to_run() {
 #[cfg(target_os = "linux")]
 #[test]
 fn request_sent_in_two_writes_is_not_held_up_by_a_delayed_ack() {
-    let port = 38113;
+    let port = 28113;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -302,7 +302,7 @@ fn request_sent_in_two_writes_is_not_held_up_by_a_delayed_ack() {
 #[cfg(target_os = "linux")]
 #[test]
 fn slow_handlers_do_not_hold_up_an_open_connection() {
-    let port = 38114;
+    let port = 28114;
     thread::spawn(move || {
         pin_to_current_cpu();
         let mut s = Server::new(());
@@ -351,7 +351,7 @@ fn slow_handlers_do_not_hold_up_an_open_connection() {
 #[test]
 fn large_response_survives_a_client_pause() {
     const BODY_BYTES: usize = 64 * 1024 * 1024;
-    let port = 38115;
+    let port = 28115;
     start_large_server(port, BODY_BYTES);
 
     let mut stream = connect(port);
@@ -366,7 +366,7 @@ fn large_response_survives_a_client_pause() {
 // Headers past the limit are refused even when they all arrive in the first receive
 #[test]
 fn oversized_headers_are_dropped() {
-    let port = 38116;
+    let port = 28116;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -381,7 +381,7 @@ fn oversized_headers_are_dropped() {
 
 #[test]
 fn chunked_body_is_received_and_decoded() {
-    let port = 38117;
+    let port = 28117;
     start_server(port);
     let response = send(
         port,
@@ -393,7 +393,7 @@ fn chunked_body_is_received_and_decoded() {
 
 #[test]
 fn chunked_body_split_across_writes_is_reassembled() {
-    let port = 38118;
+    let port = 28118;
     start_server(port);
     let mut stream = connect(port);
     for part in [
@@ -416,7 +416,7 @@ fn chunked_body_split_across_writes_is_reassembled() {
 // Malformed chunks must get an answer rather than leaving the connection waiting for bytes that will never make sense
 #[test]
 fn malformed_chunked_body_gets_400() {
-    let port = 38119;
+    let port = 28119;
     start_server(port);
     let response = send(port, b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nnot hex\r\nhello\r\n");
     assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "response: {response:?}");
@@ -424,7 +424,7 @@ fn malformed_chunked_body_gets_400() {
 
 #[test]
 fn non_utf8_body_is_available_byte_for_byte() {
-    let port = 38120;
+    let port = 28120;
     start_server(port);
 
     let response = send(port, b"POST /hex HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n\xff\x00\xfe\x80");
@@ -441,7 +441,7 @@ fn non_utf8_body_is_available_byte_for_byte() {
 // sent, and that must not reach the body, whose lengths count the bytes as they were sent
 #[test]
 fn non_utf8_header_leaves_the_body_as_it_was_sent() {
-    let port = 38121;
+    let port = 28121;
     start_server(port);
 
     let response = send(
@@ -466,7 +466,7 @@ fn non_utf8_header_leaves_the_body_as_it_was_sent() {
 // must hand the request over as soon as the head arrives instead of waiting for chunks that never come
 #[test]
 fn chunked_with_content_length_gets_400_straight_away() {
-    let port = 38122;
+    let port = 28122;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -483,7 +483,7 @@ fn chunked_with_content_length_gets_400_straight_away() {
 // listener has to find the end of the head the same way
 #[test]
 fn head_is_framed_the_way_the_parser_reads_it() {
-    let port = 38123;
+    let port = 28123;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -501,7 +501,7 @@ fn head_is_framed_the_way_the_parser_reads_it() {
 // The extra bytes stand in for anything a client sends past its request, like a pipelined request
 #[test]
 fn response_is_sent_before_a_close_with_unread_data() {
-    let port = 38124;
+    let port = 28124;
     start_server(port);
     send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
@@ -526,7 +526,7 @@ fn response_is_sent_before_a_close_with_unread_data() {
 #[cfg(target_os = "linux")]
 #[test]
 fn requests_waiting_for_a_worker_are_not_closed_as_idle() {
-    let port = 38125;
+    let port = 28125;
     thread::spawn(move || {
         pin_to_current_cpu();
         let mut s = Server::new(());
@@ -578,7 +578,7 @@ fn start_large_server(port: i32, body_bytes: usize) {
 #[test]
 fn large_response_survives_a_slow_steady_reader() {
     const BODY_BYTES: usize = 64 * 1024 * 1024;
-    let port = 38126;
+    let port = 28126;
     start_large_server(port, BODY_BYTES);
 
     let mut stream = connect(port);
@@ -600,7 +600,7 @@ fn large_response_survives_a_slow_steady_reader() {
 #[test]
 fn client_that_stops_reading_is_closed() {
     const BODY_BYTES: usize = 64 * 1024 * 1024;
-    let port = 38127;
+    let port = 28127;
     start_large_server(port, BODY_BYTES);
 
     let mut stream = connect(port);
@@ -619,7 +619,7 @@ fn client_that_stops_reading_is_closed() {
 #[test]
 fn large_response_arrives_whole_with_unread_data() {
     const BODY_BYTES: usize = 8 * 1024 * 1024;
-    let port = 38128;
+    let port = 28128;
     start_large_server(port, BODY_BYTES);
 
     for extra in [&b"\r\n"[..], &[b'a'; 64 * 1024]] {
@@ -651,7 +651,7 @@ fn large_response_arrives_whole_with_unread_data() {
 fn client_that_floods_while_its_response_lingers_is_closed() {
     // Small enough for the kernel to take all of it at once, and too large to all go out to a client that reads none
     const BODY_BYTES: usize = 1024 * 1024;
-    let port = 38131;
+    let port = 28131;
     start_large_server(port, BODY_BYTES);
 
     let mut stream = connect(port);
@@ -744,7 +744,7 @@ fn idle_connections_do_not_stop_requests_being_taken_from_a_busy_worker() {
         limit.rlim_cur = limit.rlim_max.min(8192);
         assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
     }
-    let port = 38129;
+    let port = 28129;
     start_pinned_server(port);
 
     drop(connect(port));
@@ -780,7 +780,7 @@ fn idle_connections_do_not_stop_requests_being_taken_from_a_busy_worker() {
 #[cfg(target_os = "linux")]
 #[test]
 fn every_worker_takes_its_share_of_queued_requests() {
-    let port = 38130;
+    let port = 28130;
     start_pinned_server(port);
     drop(connect(port));
 
