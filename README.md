@@ -1,12 +1,20 @@
 # Builder
 
-A rust backend framework that optimizes for speed by being efficient and giving users clear implementations allowing for quick development.
+Builder is an early-stage Rust project intended to become a full-stack web framework. It aims to combine efficient runtime behavior with clear implementations that make application development straightforward.
+
+## Project direction
+
+The goal is to bring server-side application logic and HTML rendering into one framework. The planned approach includes HTML template files that are compiled into Rust source files at build time.
+
+The template syntax, generated code, application APIs, and overall design are still being explored. This describes the intended direction, rather than a finalized design or a set of features available today.
+
+Development currently focuses on the underlying HTTP server and platform-specific socket implementations described below.
 
 ## Supported Architectures
 
-Builder requires a 64 bit linux or windows environment
+Builder currently requires a 64-bit Linux or Windows environment.
 
-## Implementation details
+## Current implementation
 
 The sockets are specifically implemented via os-specific sockets because they will later be optimized for speed and the os-control is desired.
 
