@@ -4,6 +4,8 @@ mod data;
 #[macro_use]
 pub mod logger;
 
+#[cfg(feature = "sqlite")]
+pub mod database;
 pub mod http_request;
 pub mod http_response;
 pub mod image;

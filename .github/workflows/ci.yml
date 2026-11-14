@@ -64,7 +64,7 @@ jobs:
 
       # Step 5: Execute your test cases
       - name: Run Cargo Tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --features sqlite
 
   test-windows:
 
@@ -89,7 +89,7 @@ jobs:
 
       # Step 4: Execute your test cases
       - name: Run Cargo Tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --features sqlite
 
   clippy:
     name: clippy (${{ matrix.os }})
@@ -107,4 +107,4 @@ jobs:
         with:
           key: clippy-${{ matrix.os }}
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features sqlite -- -D warnings

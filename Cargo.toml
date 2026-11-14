@@ -23,3 +23,10 @@ harness = false
 [[bench]]
 name = "compare"
 harness = false
+
+[dependencies]
+rusqlite = { version = "0.42.0", features = ["bundled"], optional = true }
+
+[features]
+# Enables builder::database, which bundles SQLite
+sqlite = ["dep:rusqlite"]
