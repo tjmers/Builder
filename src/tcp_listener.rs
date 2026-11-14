@@ -1,7 +1,7 @@
 use std::borrow::Cow;
-use std::io;
 use std::time::Duration;
 
+use crate::http_request::{scan_head, BodyKind, ChunkError, ChunkWalker};
 use crate::ip_address::IpAddress;
 
 #[cfg(windows)]
@@ -13,16 +13,12 @@ pub type NativeSocket = libc::c_int;
 #[cfg(not(any(windows, target_os = "linux")))]
 compile_error!("OS Not supported");
 
-// Platform implementations of new, bind, valid, run, and drop, plus the raw recv and send calls
+// Platform implementations of new, bind, valid, run, and drop
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
-use linux as platform;
 
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
-use windows as platform;
 
 // Takes the listener's context (e.g. the server), the raw request bytes, and the client address,
 // and returns the raw response bytes to send
@@ -37,143 +33,430 @@ pub struct TcpListener<'a, C> {
     port: i32,
 }
 
-const RECV_CHUNK_BYTES: usize = 4096;
-
 // A connection that sends nothing for this long is closed
 // Browsers open spare "preconnect" sockets they may never send a request on, so an idle connection is normal
 // and must not tie up the server
-const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+// Idle connections are swept periodically, so the effective limit is up to a sweep interval longer
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// A connection with a response left to send is closed after this long without the client taking any of it
+// Longer than IDLE_TIMEOUT since a client that pauses partway through a download has not necessarily gone away, but
+// still bounded so a client that stops reading cannot hold on to the response forever
+pub(crate) const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Requests over these limits are dropped
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-// Finds the end of the headers (just past the blank line), accepting CRLF or bare LF line endings
-fn header_end(buf: &[u8]) -> Option<usize> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
+// How much each recv reads at most, enough for a typical request with a small body in one call
+// A receive buffer no larger than this is kept for the next connection
+pub(crate) const RECV_BYTES: usize = 16 * 1024;
+
+// The least spare room a receive is given
+// A buffer with this much left is received into as it is, since growing it would copy what has arrived and leave it
+// too large to keep for the next connection
+const MIN_RECV_ROOM: usize = 4 * 1024;
+
+// Makes sure request has room to receive into, growing it by RECV_BYTES only once it is nearly full
+// A small request that arrives in more than one piece therefore stays in the buffer it started in
+pub(crate) fn reserve_recv_room(request: &mut Vec<u8>) {
+    if request.capacity() - request.len() < MIN_RECV_ROOM {
+        request.reserve(RECV_BYTES);
     }
 }
 
-// The value of the Content-Length header, or 0 if there isn't a valid one
-fn content_length(headers: &[u8]) -> usize {
-    String::from_utf8_lossy(headers)
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.eq_ignore_ascii_case("Content-Length").then(|| value.trim().parse().ok())?
-        })
-        .unwrap_or(0)
+// Ends the process if the thread holding it panics
+// Only a handler's panic is caught (see TcpListener::handle), so a panic anywhere else would end its thread for
+// good while run carries on without it: a worker that no longer accepts, or no rescue thread and no idle sweep
+// A server left holding its port but answering nothing is worse than one that stops and can be restarted
+pub(crate) struct AbortOnPanic;
+
+impl Drop for AbortOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            log_error!("A listener thread panicked outside a request handler, so the server is stopping");
+            std::process::abort();
+        }
+    }
 }
 
-// Appends the next chunk received on conn to buf
-// Returns false if the connection closed or errored
-fn recv_chunk(conn: NativeSocket, chunk: &mut [u8], buf: &mut Vec<u8>) -> bool {
-    let n = match platform::recv(conn, chunk) {
-        Ok(n) => n,
-        // The receive timeout expired (linux reports WouldBlock, Windows TimedOut)
-        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-            log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, buf.len());
-            return false;
-        }
-        Err(e) => {
-            log_error!("recv: {}", e);
-            return false;
-        }
-    };
-    if n == 0 {
-        if buf.is_empty() {
-            log_error!("Connection closed before a request was received");
+impl<'a, C> TcpListener<'a, C> {
+    // Runs the handler on the complete request at the front of request, which is its first total bytes, and returns
+    // the response, or None if the handler panicked
+    // request is left empty, ready to be kept for the next connection, unless an unusually large request grew it
+    pub(crate) fn handle(&self, request: &mut Vec<u8>, total: usize, ip: IpAddress) -> Option<Cow<'a, [u8]>> {
+        // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
+        request.truncate(total);
+
+        // A handler that panics only takes down its own connection, not the worker serving many others
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.handler)(self.context, request, ip)));
+        if request.capacity() > RECV_BYTES {
+            *request = Vec::new();
         } else {
-            log_error!("Connection closed after {} bytes, before the full request was received", buf.len());
+            request.clear();
         }
-        return false;
+        if handled.is_err() {
+            log_error!("The request handler panicked");
+        }
+        handled.ok()
     }
-    buf.extend_from_slice(&chunk[..n]);
-    true
 }
 
-// Reads one full request from conn: the request line and headers, then Content-Length bytes of body
-// Returns None if the connection closed or errored first, or if the request is too large
-fn recv_request(conn: NativeSocket) -> Option<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; RECV_CHUNK_BYTES];
-
-    let header_len = loop {
-        if let Some(end) = header_end(&buf) {
-            break end;
-        }
-        if buf.len() > MAX_HEADER_BYTES {
-            log_error!("Request headers exceed {} bytes", MAX_HEADER_BYTES);
-            return None;
-        }
-        if !recv_chunk(conn, &mut chunk, &mut buf) {
-            return None;
-        }
-    };
-
-    let body_len = content_length(&buf[..header_len]);
-    if body_len > MAX_BODY_BYTES {
-        log_error!("Request body of {} bytes exceeds {} bytes", body_len, MAX_BODY_BYTES);
-        return None;
-    }
-
-    let total = header_len + body_len;
-    while buf.len() < total {
-        if !recv_chunk(conn, &mut chunk, &mut buf) {
-            return None;
-        }
-    }
-    // Anything past the body (e.g. a pipelined request) is discarded since the connection is closed after responding
-    buf.truncate(total);
-    Some(buf)
+// How far along the request in a connection's receive buffer is
+pub(crate) enum Framing {
+    // More bytes are needed
+    Incomplete,
+    // The request is the first this many bytes (anything after, like a pipelined request, is not part of it)
+    Complete(usize),
+    // The request is over the size limits and the connection should be dropped
+    TooLarge,
 }
 
-// Sends all of data, retrying on partial sends
-fn send_all(conn: NativeSocket, data: &[u8]) -> bool {
-    let mut sent = 0;
-    while sent < data.len() {
-        match platform::send(conn, &data[sent..]) {
-            Ok(n) if n > 0 => sent += n,
-            Ok(_) => {
-                log_error!("send: no bytes were sent");
-                return false;
+// What a Framer knows about its request so far
+#[derive(Default)]
+enum Stage {
+    // The head has not all arrived
+    #[default]
+    Head,
+    // The head has been read, and the request ends this many bytes in
+    Length(usize),
+    // The head, of header_len bytes, has been read and is followed by chunks
+    Chunked { header_len: usize, chunks: ChunkWalker },
+}
+
+// Frames the one request a connection sends: the request line and headers, then a body of Content-Length bytes or
+// chunks
+// It keeps its place between receives, so the head is read once and each chunk once, however many pieces the
+// request arrives in
+// Shared by the Windows and linux listeners so both apply the same limits, and it reads the head with the parser's
+// own scan (scan_head), so the two cannot disagree about where a request ends or whether it is valid
+// The server then splits the head off with head_len, which is the same walk over the lines (walk_head)
+#[derive(Default)]
+pub(crate) struct Framer {
+    stage: Stage,
+}
+
+impl Framer {
+    // buf is everything received so far, which only ever grows between calls
+    pub(crate) fn advance(&mut self, buf: &[u8]) -> Framing {
+        if let Stage::Head = self.stage {
+            let (header_len, body) = match scan_head(buf) {
+                Some((header_len, body)) if header_len <= MAX_HEADER_BYTES => (header_len, body),
+                None if buf.len() <= MAX_HEADER_BYTES => return Framing::Incomplete,
+                _ => {
+                    log_error!("Request headers exceed {} bytes", MAX_HEADER_BYTES);
+                    return Framing::TooLarge;
+                }
+            };
+            self.stage = match body {
+                Ok(BodyKind::Length(body_len)) if body_len > MAX_BODY_BYTES => {
+                    log_error!("Request body of {} bytes exceeds {} bytes", body_len, MAX_BODY_BYTES);
+                    return Framing::TooLarge;
+                }
+                Ok(BodyKind::Length(body_len)) => Stage::Length(header_len + body_len),
+                Ok(BodyKind::Chunked) => Stage::Chunked { header_len, chunks: ChunkWalker::default() },
+                // The server answers another transfer coding with 501 without reading a body
+                Ok(BodyKind::None | BodyKind::OtherCoding) => Stage::Length(header_len),
+                // The parser is going to reject these headers (e.g. Transfer-Encoding alongside Content-Length), so
+                // hand everything over for it to answer with a 400, rather than waiting for a body that cannot be
+                // trusted to end where the headers say
+                Err(_) => return Framing::Complete(buf.len()),
+            };
+        }
+
+        match &mut self.stage {
+            Stage::Head => Framing::Incomplete,
+            Stage::Length(total) if buf.len() < *total => Framing::Incomplete,
+            Stage::Length(total) => Framing::Complete(*total),
+            Stage::Chunked { header_len, chunks } => {
+                let header_len = *header_len;
+                match chunks.advance(&buf[header_len..], |_| {}) {
+                    Ok(body_len) if body_len <= MAX_BODY_BYTES => Framing::Complete(header_len + body_len),
+                    // Hand everything over so the parser answers it with a 400, rather than waiting for bytes that will not help
+                    Err(ChunkError::Malformed) => Framing::Complete(buf.len()),
+                    Err(ChunkError::Incomplete) if buf.len() <= header_len + MAX_BODY_BYTES => Framing::Incomplete,
+                    // The limit applies to the body with its framing, which is all that is known before the end has arrived
+                    _ => {
+                        log_error!("Chunked request body exceeds {} bytes", MAX_BODY_BYTES);
+                        Framing::TooLarge
+                    }
+                }
             }
-            Err(e) => {
-                log_error!("send: {}", e);
-                return false;
+        }
+    }
+}
+
+// Logs why a connection closed before its request was complete, given the bytes received so far
+pub(crate) fn log_closed_early(received: usize) {
+    if received == 0 {
+        log_error!("Connection closed before a request was received");
+    } else {
+        log_error!("Connection closed after {} bytes, before the full request was received", received);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Frames a request that has arrived all at once
+    fn request_len(buf: &[u8]) -> Framing {
+        Framer::default().advance(buf)
+    }
+
+    #[test]
+    fn request_len_finds_crlf_and_bare_lf_blank_lines() {
+        assert!(matches!(request_len(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nbody"), Framing::Complete(27)));
+        assert!(matches!(request_len(b"GET / HTTP/1.1\nHost: a\n\nbody"), Framing::Complete(24)));
+        assert!(matches!(request_len(b"GET / HTTP/1.1\r\nHost: a\r\n"), Framing::Incomplete));
+        assert!(matches!(request_len(b""), Framing::Incomplete));
+    }
+
+    #[test]
+    fn request_len_ends_the_head_where_the_parser_does() {
+        // The parser takes a line ending in LF or CRLF, in any mix, so an LF line followed by a CRLF blank line ends the head
+        assert!(matches!(request_len(b"GET / HTTP/1.1\nHost: a\n\r\nbody"), Framing::Complete(25)));
+        // It also skips empty lines before the request line, so they do not end the head
+        assert!(matches!(request_len(b"\r\n\r\n"), Framing::Incomplete));
+        assert!(matches!(request_len(b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"), Framing::Complete(31)));
+    }
+
+    // The server splits the head off the request the listener framed, so both have to end it at the same byte
+    #[test]
+    fn head_len_ends_the_head_where_the_framer_does() {
+        use crate::http_request::head_len;
+        let requests: [&[u8]; 5] = [
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nbody",
+            b"GET / HTTP/1.1\nHost: a\n\r\nbody",
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            b"POST / HTTP/1.1\r\n\r\nline\n\nmore\r\n\r\n",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello",
+        ];
+        for request in requests {
+            let (framed, _) = scan_head(request).expect("the head is complete");
+            assert_eq!(head_len(request).ok(), Some(framed));
+        }
+        for unfinished in [&b""[..], b"\r\n\r\n", b"GET / HTTP/1.1\r\nHost: a\r\n"] {
+            assert!(scan_head(unfinished).is_none());
+            assert!(head_len(unfinished).is_err());
+        }
+    }
+
+    #[test]
+    fn request_len_stops_at_the_first_blank_line() {
+        // A blank line inside the body must not move the end of the headers
+        assert!(matches!(request_len(b"POST / HTTP/1.1\r\n\r\nline\n\nmore\r\n\r\n"), Framing::Complete(19)));
+    }
+
+    #[test]
+    fn request_len_hands_headers_the_parser_rejects_straight_to_it() {
+        // No body is waited for, since the parser answers these with a 400 whatever follows
+        let both = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello";
+        assert!(matches!(request_len(both), Framing::Complete(n) if n == both.len()));
+
+        let conflicting = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 50\r\n\r\n";
+        assert!(matches!(request_len(conflicting), Framing::Complete(n) if n == conflicting.len()));
+
+        let not_a_number = b"POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n";
+        assert!(matches!(request_len(not_a_number), Framing::Complete(n) if n == not_a_number.len()));
+    }
+
+    // Feeds request to one Framer in pieces of at most step bytes, as it would arrive over several receives
+    // Returns the framing once it is no longer incomplete, and how many bytes had arrived by then
+    fn frame_in_pieces(request: &[u8], step: usize) -> (Framing, usize) {
+        let mut framer = Framer::default();
+        let mut len = 0;
+        loop {
+            len = (len + step).min(request.len());
+            match framer.advance(&request[..len]) {
+                Framing::Incomplete if len < request.len() => {}
+                framing => return (framing, len),
             }
         }
     }
-    true
-}
 
-impl<C> TcpListener<'_, C> {
-    // Reads one request from an accepted connection and sends back the handler's response
-    // The caller is responsible for closing conn
-    fn serve(&self, conn: NativeSocket, ip: IpAddress) {
-        if let Some(request) = recv_request(conn) {
-            // This is a request -- call the request handler
-            let response = (self.handler)(self.context, &request, ip);
-
-            // Send back the response
-            // The only copy is the one send makes into the kernel's socket buffer
-            send_all(conn, &response);
+    #[test]
+    fn framer_keeps_its_place_between_receives() {
+        let requests: [&[u8]; 3] = [
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nTrailer: x\r\n\r\n",
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+            b"\r\nGET / HTTP/1.1\nHost: a\n\r\n",
+        ];
+        for request in requests {
+            for step in [1, 2, 3, 7] {
+                // Complete exactly when the last byte arrives, and not before
+                let (framing, arrived) = frame_in_pieces(request, step);
+                assert!(matches!(framing, Framing::Complete(n) if n == request.len()), "in pieces of {step}");
+                assert_eq!(arrived, request.len(), "in pieces of {step}");
+            }
         }
     }
 
-    // Serves one accepted connection, then closes it
-    // Run on its own thread for each connection, so a client that is slow or never sends a request
-    // (like a browser's preconnect socket) does not block every other client
-    fn serve_connection(&self, conn: NativeSocket, ip: IpAddress) {
-        if let Err(e) = platform::set_recv_timeout(conn, IDLE_TIMEOUT) {
-            log_error!("Failed to set the receive timeout: {}", e);
+    // Walking the chunks again from the first one after every receive would take time that grows with the square of
+    // the body, which let one client sending tiny chunks in tiny pieces keep a worker busy for minutes
+    #[test]
+    fn framer_reads_each_chunk_of_a_body_of_tiny_chunks_once() {
+        let mut request = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let head_len = request.len();
+        while request.len() - head_len < MAX_BODY_BYTES - 64 {
+            request.extend_from_slice(b"1\r\na\r\n");
         }
-        self.serve(conn, ip);
-        platform::close(conn);
+        request.extend_from_slice(b"0\r\n\r\n");
+
+        let start = std::time::Instant::now();
+        let (framing, _) = frame_in_pieces(&request, 64);
+        assert!(matches!(framing, Framing::Complete(n) if n == request.len()));
+        // About 16,000 receives: milliseconds when each chunk is read once, and minutes when they are all read every time
+        assert!(start.elapsed() < Duration::from_secs(2), "framing took {:?}", start.elapsed());
+    }
+
+    // A chunked body that stops short of a line ending, sent in small pieces, must not be searched again from the
+    // start of that line on every receive
+    // Each of these took seconds of CPU for one request when it was
+    #[test]
+    fn framer_reads_a_chunked_body_with_an_unfinished_line_once() {
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let filler = MAX_BODY_BYTES - 1024;
+
+        // A chunk size that never ends
+        let mut endless_size = head.to_vec();
+        endless_size.resize(head.len() + filler, b'1');
+        // A long chunk extension, complete, and then the chunk's data in small pieces
+        let mut long_extension = head.to_vec();
+        long_extension.extend_from_slice(format!("{:x};", filler / 2).as_bytes());
+        long_extension.resize(head.len() + filler / 2, b'e');
+        long_extension.extend_from_slice(b"\r\n");
+        long_extension.resize(long_extension.len() + filler / 2, b'a');
+        // A trailer that never ends
+        let mut endless_trailer = head.to_vec();
+        endless_trailer.extend_from_slice(b"0\r\n");
+        endless_trailer.resize(head.len() + filler, b't');
+
+        for (name, request) in [("size", endless_size), ("extension", long_extension), ("trailer", endless_trailer)] {
+            let start = std::time::Instant::now();
+            let (framing, arrived) = frame_in_pieces(&request, 16);
+            assert!(matches!(framing, Framing::Incomplete), "unfinished {name}");
+            assert_eq!(arrived, request.len(), "unfinished {name}");
+            // About 65,000 receives: milliseconds when each byte is read once, and most of a minute when the line is
+            // read again every time
+            assert!(start.elapsed() < Duration::from_secs(2), "framing an unfinished {name} took {:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    fn framer_refuses_anything_but_a_line_ending_after_chunk_data() {
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        // Handed to the parser as soon as the byte after the data shows it is malformed, with no line ending in sight
+        let mut request = head.clone();
+        request.extend_from_slice(b"3\r\nabcx");
+        assert!(matches!(request_len(&request), Framing::Complete(n) if n == request.len()));
+        // A CR alone could still become a CRLF
+        let mut request = head.clone();
+        request.extend_from_slice(b"3\r\nabc\r");
+        assert!(matches!(request_len(&request), Framing::Incomplete));
+    }
+
+    // Growing the buffer for every receive doubled it on a request's second receive, however small the request,
+    // which also left it too large to keep for the next connection
+    #[test]
+    fn receive_buffer_only_grows_once_it_is_nearly_full() {
+        let mut request = Vec::new();
+        reserve_recv_room(&mut request);
+        let capacity = request.capacity();
+        assert!(capacity >= RECV_BYTES);
+
+        // A request whose first piece has arrived, with plenty of room left for the rest
+        request.resize(capacity - MIN_RECV_ROOM, b'a');
+        reserve_recv_room(&mut request);
+        assert_eq!(request.capacity(), capacity);
+
+        // Nearly full, so the next receive would otherwise be a small one
+        request.push(b'a');
+        reserve_recv_room(&mut request);
+        assert!(request.capacity() - request.len() >= RECV_BYTES);
+    }
+
+    #[test]
+    fn request_len_frames_by_content_length() {
+        let head = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+        let mut buf = head.to_vec();
+        assert!(matches!(request_len(&buf), Framing::Incomplete));
+        buf.extend_from_slice(b"hel");
+        assert!(matches!(request_len(&buf), Framing::Incomplete));
+        buf.extend_from_slice(b"lo and a pipelined request");
+        assert!(matches!(request_len(&buf), Framing::Complete(n) if n == head.len() + 5));
+    }
+
+    #[test]
+    fn request_len_rejects_oversized_requests() {
+        let mut headers = b"GET / HTTP/1.1\r\n".to_vec();
+        headers.resize(MAX_HEADER_BYTES + 1, b'a');
+        assert!(matches!(request_len(&headers), Framing::TooLarge));
+
+        let body = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
+        assert!(matches!(request_len(body.as_bytes()), Framing::TooLarge));
+    }
+
+    // A complete request with no body whose head is exactly len bytes
+    fn head_of_len(len: usize) -> Vec<u8> {
+        let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
+        head.resize(len - 4, b'a');
+        head.extend_from_slice(b"\r\n\r\n");
+        head
+    }
+
+    #[test]
+    fn request_len_applies_the_header_limit_to_a_complete_head() {
+        let at_limit = head_of_len(MAX_HEADER_BYTES);
+        assert!(matches!(request_len(&at_limit), Framing::Complete(n) if n == MAX_HEADER_BYTES));
+        assert!(matches!(request_len(&head_of_len(MAX_HEADER_BYTES + 1)), Framing::TooLarge));
+    }
+
+    #[test]
+    fn request_len_frames_chunked_bodies() {
+        let request = b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nTrailer: x\r\n\r\n";
+        // Every prefix past the head needs more bytes
+        for len in b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n".len()..request.len() {
+            assert!(matches!(request_len(&request[..len]), Framing::Incomplete), "prefix of {len} bytes");
+        }
+        assert!(matches!(request_len(request), Framing::Complete(n) if n == request.len()));
+
+        let mut pipelined = request.to_vec();
+        pipelined.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        assert!(matches!(request_len(&pipelined), Framing::Complete(n) if n == request.len()));
+    }
+
+    #[test]
+    fn request_len_hands_malformed_chunks_to_the_parser() {
+        let bad_size = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\n";
+        assert!(matches!(request_len(bad_size), Framing::Complete(n) if n == bad_size.len()));
+
+        let bad_end = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nabc\r\n";
+        assert!(matches!(request_len(bad_end), Framing::Complete(n) if n == bad_end.len()));
+    }
+
+    #[test]
+    fn request_len_rejects_oversized_chunked_bodies() {
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+
+        // Still arriving, and already over the limit
+        let mut unfinished = head.clone();
+        unfinished.extend_from_slice(format!("{:x}\r\n", MAX_BODY_BYTES * 2).as_bytes());
+        unfinished.resize(head.len() + MAX_BODY_BYTES + 1, b'a');
+        assert!(matches!(request_len(&unfinished), Framing::TooLarge));
+
+        // Finished, but over the limit
+        let mut finished = head.clone();
+        finished.extend_from_slice(format!("{:x}\r\n", MAX_BODY_BYTES + 1).as_bytes());
+        finished.resize(finished.len() + MAX_BODY_BYTES + 1, b'a');
+        finished.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert!(matches!(request_len(&finished), Framing::TooLarge));
+    }
+
+    #[test]
+    fn request_len_ignores_other_transfer_codings() {
+        // The parser leaves these for the server to answer with 501, so nothing more is waited for
+        let gzip = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n";
+        assert!(matches!(request_len(gzip), Framing::Complete(n) if n == gzip.len()));
     }
 }

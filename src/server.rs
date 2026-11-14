@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::http_request::{HttpRequest, Method};
+use crate::http_request::{to_text, HttpRequest, Method, ParseError};
 use crate::http_response::{HttpResponse, HttpResponseBuilder, Status, VERSIONS_SUPPORTED};
 use crate::ip_address::IpAddress;
 use crate::tcp_listener::TcpListener;
@@ -186,17 +186,27 @@ impl<S> Server<S> {
     // The listener's raw request handler: parses the request bytes and returns the response bytes to send
     // A cached response is returned as Cow::Borrowed from self, so the only copy is the one send makes
     fn handle_raw<'s>(&'s self, request: &[u8], addr: IpAddress) -> Cow<'s, [u8]> {
-        // Borrows the bytes when they are valid UTF-8, and only copies to replace invalid sequences
-        let request = String::from_utf8_lossy(request);
-        let request = match HttpRequest::new(&request) {
-            Ok(req) => req,
+        // Only the head is checked as UTF-8 here, and the body only if the handler reads it, since validating a
+        // 4kb body cost more than routing the request
+        let (head, rest) = match HttpRequest::split_head(request) {
+            Ok(parts) => parts,
+            Err(e) => return self.respond(Err(e), &addr),
+        };
+        // A head that is not UTF-8 has its invalid sequences replaced, and the parser judges what is left
+        // Only the head: the body's lengths count the bytes as they were sent, so it must stay as it is
+        let head = to_text(head);
+        self.respond(HttpRequest::from_parts(&head, rest), &addr)
+    }
+
+    fn respond(&self, parsed: Result<HttpRequest<'_>, ParseError>, addr: &IpAddress) -> Cow<'_, [u8]> {
+        match parsed {
+            // A handler returning a response cached in the state comes back as Cow::Borrowed
+            Ok(request) => self.invoke(&request, addr).into_bytes(),
             Err(e) => {
                 log_error!("400 Bad Request: {}", e);
-                return HttpResponseBuilder::new(Status::BadRequest).build().into_bytes();
+                HttpResponseBuilder::new(Status::BadRequest).build().into_bytes()
             }
-        };
-        // A handler returning a response cached in the state comes back as Cow::Borrowed
-        self.invoke(&request, &addr).into_bytes()
+        }
     }
 
     // The state is shared by the threads serving each connection, so it must be Sync
