@@ -1,0 +1,32 @@
+[package]
+name = "framework-benches"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace root, so the builder crate's CI never compiles tokio, actix, or these benches
+[workspace]
+
+[dependencies]
+builder = { path = ".." }
+actix-web = { version = "4.18.1", default-features = false }
+axum = "0.8.9"
+hdrhistogram = { version = "7", default-features = false }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time"] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+httparse = "1"
+matchit = "0.8"
+
+[[bench]]
+name = "wire"
+harness = false
+
+[[bench]]
+name = "components"
+harness = false
