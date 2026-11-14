@@ -8,7 +8,8 @@ This branch replaces the server's one-thread-per-connection model with a fixed p
 | **Commits** | `e0f62d7` (Linux and parsing), `16445a3` (Windows) |
 | **Size** | 8 files, +1581 / -307 lines, before the audit fixes |
 | **Audit fixes** | The fixes for `audit.md`, committed in `39ec2b7` |
-| **Second audit fixes** | The fixes for all 10 findings in `audit_mc1.md`, not committed yet |
+| **Second audit fixes** | The fixes for all 10 findings in `audit_mc1.md`, committed in `46c9b96` |
+| **Third audit fixes** | The fixes for all 10 findings in `audit_mc2.md`, not committed yet |
 
 ## Before and after
 
@@ -17,7 +18,7 @@ This branch replaces the server's one-thread-per-connection model with a fixed p
 | **Threads** | One new thread per connection | One pinned worker per CPU, `max(CPUs, 4)` parked workers, plus a rescue and sweep thread | Two workers per core, plus a pool and sweep thread |
 | **Socket I/O** | Blocking `recv` and `send` | Non-blocking, with epoll for connections that have to wait | Overlapped `WSARecv` and `WSASend`, with a completion port |
 | **Accepting** | One blocking `accept` loop | Each worker has its own `SO_REUSEPORT` socket and waits in a blocking `accept4` | A pool of 64 outstanding `AcceptEx` calls |
-| **Idle timeout** | 5s per `recv` (`SO_RCVTIMEO`) | Swept every second: 5s while receiving, 30s while sending | Swept every second, using `CancelIoEx`: 5s while receiving, 30s while sending |
+| **Idle timeout** | 5s per `recv` (`SO_RCVTIMEO`) | Swept every second: 5s without receiving anything, or 30s without the client acknowledging any of the response | Swept every second, using `CancelIoEx`: 5s while receiving, 30s for each 16KB piece of the response |
 | **Handler panic** | Not caught | Caught; only that connection is lost | Caught; only that connection is lost |
 
 An idle connection, such as a browser's unused preconnect socket, now takes up a map entry instead of a thread.
@@ -27,7 +28,7 @@ An idle connection, such as a browser's unused preconnect socket, now takes up a
 ### Threads
 - **Pinned workers:** one per CPU the calling thread may use, each pinned to that CPU with its own listening socket. `SO_INCOMING_CPU` steers connections to the worker on the CPU that handled their packets. The usual path is `accept4`, `recv`, `send`, `close`, with no epoll calls and no shared lock. In a counted benchmark run with `SCHED_IDLE` still on, 32 of 5.4 million connections left this path.
 - **Parked workers:** `max(CPUs, 4)` unpinned threads waiting in `epoll_wait` on one shared epoll, taking one event at a time. Taking a batch would leave the rest waiting behind that thread's handler.
-- **Rescue thread:** the calling thread checks every 10ms for a worker that has made no progress while connections wait on its socket, and moves those connections to the parked workers. It never runs a handler, so a slow handler can't stop it. It also closes idle connections once a second. After 10 checks in a row that find nothing going on, it stops checking and waits in `poll` on the workers' sockets until a connection arrives or the sweep is due, so an idle server wakes about twice a second instead of 100 times.
+- **Rescue thread:** the calling thread checks every 10ms for a worker that has made no progress while connections wait on its socket, and moves as many of those connections to the parked workers as there are parked workers free. It never runs a handler, so a slow handler can't stop it. It also closes idle connections once a second. After 10 checks in a row that find nothing going on, it stops checking and waits in `poll` on the workers' sockets until a connection arrives or the sweep is due, so an idle server wakes about twice a second instead of 100 times.
 
 Workers run under the default scheduling policy. `SCHED_IDLE` starved handlers on a busy CPU, and `SCHED_BATCH` made fast requests about 50 times slower there (see [Performance](#performance)).
 
@@ -41,7 +42,12 @@ Workers run under the default scheduling policy. `SCHED_IDLE` starved handlers o
 ### Taking over from a stalled worker
 The rescue thread makes the socket non-blocking only while it takes connections from the queue, so it can't get stuck in `accept` if the worker wakes and takes the connections first. A worker already blocked in `accept` stays blocked, and one that arrives during that window gets `EAGAIN` and tries again.
 
-It takes at most 64 connections from one socket per check, then moves on to the other sockets and the sweep, so a flood on one socket can't keep it from the rest. It takes nothing over while 512 connections are parked. The rest wait in the kernel's queue, where they hold no file descriptor.
+Each check, it takes only as many connections as there are parked workers waiting in `epoll_wait`, and at most 64 from one socket. Each parked worker counts itself in `free_workers` while it waits. The rest stay in the kernel's queue, where they hold no file descriptor and the stalled worker can still take them when it comes back. Before the third audit fixes it took up to 64 whether or not a worker was free, so a pinned worker could come back to an empty queue while its connections waited for a parked worker. It also stopped taking anything while 512 connections were parked, which idle connections counted toward. That limit is gone: only the number of free workers limits it now.
+
+### Sending and closing
+- **Send timeout:** a client is closed when it has acknowledged none of its response for 30s. Each sweep asks the socket how many sent bytes are unacknowledged (`SIOCOUTQ`) and treats any fall as progress. Before the third audit fixes progress was a successful `send`, which a slow client allows only once about a third of the send buffer has drained, so a steady download slower than that was cut off.
+- **Closing:** closing a connection while client data is unread (a pipelined request, a line ending after the request) resets it, and a reset discards whatever part of the response hasn't gone out. After the last `send`, the worker asks how much is still unsent (`SIOCOUTQNSD`). If nothing is, it closes straight away. Otherwise it shuts down its sending side, discards what the client sends, and parks the connection until the client closes or has acknowledged everything.
+- **The sweep** removes expired connections from the map with the lock held, then logs and closes them after releasing it, so a blocked log can't hold up the workers.
 
 ### Running out of file descriptors
 When `accept4` fails with `EMFILE`, `ENFILE`, `ENOBUFS` or `ENOMEM`, the worker sleeps for 100ms before trying again and logs once per run of failures. The rescue thread pauses for the same 100ms.
@@ -54,6 +60,8 @@ When `accept4` fails with `EMFILE`, `ENFILE`, `ENOBUFS` or `ENOMEM`, the worker 
 | `SO_INCOMING_CPU` | Sends a connection to the socket of the worker on the CPU that handled its packets |
 | `TCP_DEFER_ACCEPT` (1s) | Holds a connection back from `accept` until its first data arrives, so the worker is woken only once |
 | `SOCK_CLOEXEC` | Stops sockets being inherited by child processes |
+
+`SO_INCOMING_CPU` comes from the `libc` crate, so steering applies on every architecture. Before the third audit fixes it was defined by hand for five architectures and skipped on the rest.
 
 `TCP_LINGER2` (-1) and `MSG_MORE` were removed by the second audit fixes. `MSG_MORE` held the end of the response back until `close`, and a close with client data still unread resets the connection and discards it, so the client got no response at all. `TCP_LINGER2` at -1 answered the client's final ACK with a reset, which could cost a client that discards unread data on a reset part of a response it had already received. Connections now close normally and pass through `TIME_WAIT`.
 
@@ -70,7 +78,8 @@ The first socket binds and listens without `SO_REUSEPORT`, and turns it on only 
 - When a call finishes immediately, its completion is skipped (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`) and the same thread carries on. This is turned off if a layered socket provider without real file handles is installed, because it could hand one connection to two threads at once.
 - The calling thread tops up the `AcceptEx` pool and sweeps for idle connections once a second.
 - Last-activity times are kept in one `Mutex<HashMap>` shared by all workers, with a flag for whether the connection has a response to send.
-- A response is sent in pieces of at most 64KB. A `WSASend` only completes once the client has taken all of it, so one send of a whole large response showed no progress until the end, and a client downloading it slowly looked the same as one that had stopped reading.
+- A response is sent in pieces of at most 16KB (64KB before the third audit fixes). A `WSASend` only completes once the client has taken all of it, so one send of a whole large response showed no progress until the end, and a client downloading it slowly looked the same as one that had stopped reading. A piece is the least progress the listener can see, so a client slower than one piece per 30s, about 550 bytes a second, is still closed.
+- An empty response closes the connection without a send. Before, the 0-byte send was logged as an error.
 - `Cargo.toml` adds three `windows-sys` features: `Win32_Foundation`, `Win32_Storage_FileSystem` and `Win32_System_IO`.
 
 ## Shared listener code (`src/tcp_listener.rs`)
@@ -90,7 +99,7 @@ The first socket binds and listens without `SO_REUSEPORT`, and turns it on only 
 - **New `Head` struct:** collects `Host`, `Content-Length` and `Transfer-Encoding` during the single pass over the headers. This replaces `parse_body` and the later header re-scans.
 - **`BodyHeaders` and `scan_head` (new):** `BodyHeaders` holds the rules for what kind of body a request has: the first `Transfer-Encoding` counts, repeated `Content-Length` headers must agree, and both together is invalid. `Head::parse` and `scan_head`, which the listener uses for framing, both feed their headers through it, and both split lines the same way.
 - **`HttpRequest::body` (new, public):** returns the body's bytes as sent, with any chunked encoding removed.
-- **`ChunkWalker` and `walk_chunks` (new, `pub(crate)`):** the chunk walk shared by framing and `decode_chunked`, so the two can't disagree about where a body ends. `ChunkWalker` can stop when it runs out of bytes and carry on from the last complete chunk when more arrive.
+- **`ChunkWalker` and `walk_chunks` (new, `pub(crate)`):** the chunk walk shared by framing and `decode_chunked`, so the two can't disagree about where a body ends. `ChunkWalker` can stop when it runs out of bytes and carry on from where it stopped when more arrive: inside a chunk's data, or partway along a size or trailer line. Before the third audit fixes it went back to the start of the chunk, so an unfinished line sent in small pieces was read again on every receive.
 - **`decode_chunked`:** now works on bytes.
 - **Smaller speedups:**
   - A `TCHAR` lookup table for validating tokens
@@ -104,7 +113,7 @@ Anyone relying on the old behavior should check these:
 
 1. **Bodies that aren't valid UTF-8:** `Content-Length` is now counted on the raw bytes, so a length that ends partway through a multi-byte character reaches the handler instead of returning `400`. `content()` replaces the invalid bytes, and `body()` returns them unchanged. `HttpRequest::new` still rejects this case.
 2. **Chunked bodies:** these now work over a socket, where they always got a `400` before. Chunk sizes are counted on raw bytes, and a chunk boundary can fall inside a multi-byte character.
-3. **Stalled sends:** a client that stops reading its response is now disconnected. Before, a blocking `send` had no timeout. The limit is 30s without progress on both platforms.
+3. **Stalled sends:** a client that stops reading its response is now disconnected. Before, a blocking `send` had no timeout. The limit is 30s without progress on both platforms: any acknowledged byte on Linux, and a 16KB piece on Windows.
 4. **Idle timing:** connections now close after 5–6 seconds instead of 5. On Linux, `TCP_DEFER_ACCEPT` can add about another second before a silent connection is accepted and its timer starts.
 5. **Handler panics:** the connection is closed with no response, and the worker keeps running.
 6. **Windows logging:** the `Connection from` line no longer includes the client's port.
@@ -113,6 +122,8 @@ Anyone relying on the old behavior should check these:
 9. **Head framing:** the listener now finds the end of the head the way the parser does. Empty lines before the request line are skipped, and a head whose lines end in a mix of LF and CRLF is complete. Before, the first got a `400` and the second was closed after the idle timeout.
 10. **`Transfer-Encoding` with `Content-Length`:** answered with `400` as soon as the head arrives. Before the second audit fixes it was framed as chunked and closed after the idle timeout with no response.
 11. **`TIME_WAIT` on Linux:** connections go through the normal close again, so each one stays in `TIME_WAIT` after the server closes it.
+12. **Chunk data not followed by a line ending:** answered with `400` as soon as the next byte arrives. Before the third audit fixes the listener waited for a line ending first.
+13. **Large responses on Linux:** the connection stays open after the last `send` until the client has the response, where it was closed at once before.
 
 The public `TcpListener` and `HttpRequest` methods keep their signatures, and `HttpRequest` gains `body()`.
 
@@ -121,8 +132,10 @@ The public `TcpListener` and `HttpRequest` methods keep their signatures, and `H
 - **Linux throughput:** see [Performance](#performance). Each request takes about 1.5 to 3 times as long as before the audit fixes on this benchmark, nearly all from dropping `SCHED_IDLE`.
 - **Slow handlers on Linux:** a slow handler takes up one pinned worker, and new connections queued on its socket wait up to about 20ms for the rescue thread. If every parked worker is also in a slow handler, those connections wait for one to come free. The idle sweep leaves them alone, because it skips a connection whose socket is ready. There is no limit on how long such a request waits.
 - **Pinned workers:** threads and child processes started from a handler inherit the CPU pin. The worker count follows the affinity mask rather than a cgroup CPU quota, so a container with a quota gets one worker per visible CPU. A server started from a thread pinned to one CPU gets one worker.
-- **Connection resets on Linux:** closing with client data still unread (a pipelined request, or bytes after the body) still resets the connection, as it did on `main`. The response has been sent by then, and a Linux client keeps what it received. A client that discards unread data on a reset can still lose it. Draining the unread bytes before `close` would avoid the reset, at the cost of a syscall on every connection.
-- **Rescue limits:** while 512 connections are parked, connections behind a stalled worker stay in the kernel's queue until some are served.
+- **Connection resets on Linux:** closing with client data still unread (a pipelined request, or bytes after the body) still resets the connection when the whole response has already gone out, as it did on `main`. A Linux client keeps what it received and then sees the reset where it expected the end of the response. A client that discards unread data on a reset can still lose it. A response with anything still unsent is no longer closed this way. The check costs one `ioctl` on every connection.
+- **Lingering connections on Linux:** a connection waiting for the client to take the end of a large response holds its file descriptor and the response until the client closes, the next sweep finds everything acknowledged, or 30s pass without an acknowledgement.
+- **Rescue limits:** connections behind a stalled worker stay in the kernel's queue while every parked worker is busy. The count of free workers is read once per check, so a worker woken by another connection in between leaves a rescued connection waiting for the next free one.
+- **Slow clients on Windows:** a client taking its response at under about 550 bytes a second is closed as having stopped reading.
 - **Lock contention on Windows:** every accepted connection, partial receive and handled request takes the shared last-activity lock.
 
 ## Performance
@@ -154,6 +167,18 @@ Five alternating runs of the code before and after the second audit fixes, in on
 - **Each request takes about 10 to 35% longer.** The ranges overlap at 1 and 16 clients and are separate at 4 and 12.
 - **The likely cause is dropping `MSG_MORE` and the fast close,** which adds a packet or two to each connection and leaves each one in `TIME_WAIT`. The two weren't measured separately, and the framing and rescue changes weren't either.
 
+### Cost of the third audit fixes
+
+Five alternating runs of the code before and after the third audit fixes, in one session, as medians with the range in brackets. The diagrams and this file were being edited on the same machine during the runs.
+
+| Listener | Runs | 1 client | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| Before the third audit fixes (`46c9b96`) | 5 | 46.9 µs (44.6–51.7) | 25.9 µs (25.5–27.8) | 21.2 µs (20.4–22.6) | 13.2 µs (12.6–17.2) | 10.0 µs (9.8–14.0) |
+| **After (current)** | 5 | **45.9 µs** (45.0–47.7) | **26.4 µs** (25.6–32.9) | **20.9 µs** (20.7–25.5) | **14.1 µs** (13.1–15.6) | **10.2 µs** (9.8–13.3) |
+
+- **No difference shows.** The ranges overlap at every client count, and the medians differ by 7% at most, in both directions.
+- **The extra `ioctl` after the last `send` is too small to see here.** This benchmark's 4KB response always goes out at once, so it never takes the lingering close, and that path wasn't measured.
+
 The shared pool design, kept on the `tcp-listener-shared-pool` branch, was measured over 2 runs each, alternated with the code before the audit fixes and the current code:
 
 | Shared pool | 1 client | 4 | 8 | 12 | 16 |
@@ -163,7 +188,7 @@ The shared pool design, kept on the `tcp-listener-shared-pool` branch, was measu
 
 ## Tests
 
-The branch adds 32 tests:
+The branch adds 39 tests:
 
 | Location | Test | Commit |
 |---|---|---|
@@ -199,6 +224,13 @@ The branch adds 32 tests:
 | `tests/tcp_roundtrip.rs` | `head_is_framed_the_way_the_parser_reads_it` | Second audit fixes |
 | `tests/tcp_roundtrip.rs` | `response_is_sent_before_a_close_with_unread_data` (Linux) | Second audit fixes |
 | `tests/tcp_roundtrip.rs` | `requests_waiting_for_a_worker_are_not_closed_as_idle` (Linux) | Second audit fixes |
+| `src/tcp_listener.rs` | `framer_reads_a_chunked_body_with_an_unfinished_line_once` | Third audit fixes |
+| `src/tcp_listener.rs` | `framer_refuses_anything_but_a_line_ending_after_chunk_data` | Third audit fixes |
+| `tests/tcp_roundtrip.rs` | `large_response_survives_a_slow_steady_reader` | Third audit fixes |
+| `tests/tcp_roundtrip.rs` | `client_that_stops_reading_is_closed` | Third audit fixes |
+| `tests/tcp_roundtrip.rs` | `large_response_arrives_whole_with_unread_data` (Linux) | Third audit fixes |
+| `tests/tcp_roundtrip.rs` | `idle_connections_do_not_stop_requests_being_taken_from_a_busy_worker` (Linux) | Third audit fixes |
+| `tests/tcp_roundtrip.rs` | `every_worker_takes_its_share_of_queued_requests` (Linux) | Third audit fixes |
 
 `idle_connection_does_not_block_other_requests` and `more_idle_connections_than_cores_do_not_block_other_requests` were also corrected. `TCP_DEFER_ACCEPT` meant the silent sockets hadn't been accepted when they checked, so they weren't testing idle handling on Linux.
 
@@ -206,20 +238,22 @@ The second audit fixes also changed two existing tests. `header_end_needs_a_cr_b
 
 The five new round-trip tests all fail on the code before the second audit fixes and pass after them.
 
+Of the seven tests added with the third audit fixes, six fail on the code before them (`46c9b96`) and pass after. `client_that_stops_reading_is_closed` passes on both: it guards the 30s timeout that the new progress check could have broken. Two of the tests take about 35s each, since they have to outlast that timeout, and the test binary runs them alongside the rest.
+
 ### What was checked
 
-- **Linux:** `cargo test --workspace --all-targets` passes all 120 tests, and `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+- **Linux:** `cargo test --workspace --all-targets` passes all 127 tests, and `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - **Linux, by hand:**
   - A CPU-heavy handler sharing 2 CPUs with a busy process pinned to each took a median of 185ms and at most 216ms over 200 requests, with no stalls.
   - At the file descriptor limit of 64, with 100 connections opened at once, the server used 0–4% of a core and logged 4 accept errors over 8s. It accepted connections again once the idle sweep freed descriptors.
   - Port 0 opened 16 sockets on one port.
   - An idle server made 20 voluntary context switches across all its threads in 10s, against 977 before the second audit fixes.
-- **Windows:** the library compiles and passes clippy for `x86_64-pc-windows-gnu` (`cargo clippy --lib --target x86_64-pc-windows-gnu -- -D warnings`). Nothing was run on Windows, and the tests and benches weren't compiled for it, because their dependencies need a Windows C compiler that isn't installed on the machine used. The 64KB send cap and the 30s send timeout are therefore untested, including over a real network path, which is where finding 3 applies. The `test-windows` and Windows clippy CI jobs cover the rest on pull requests to `main`.
-- **Not tested:** the rescue thread's limits (64 accepts per check, 512 parked) have no automated test, since the scenario needs a stalled worker and a sustained flood of connections.
+- **Windows:** the library compiles and passes clippy for `x86_64-pc-windows-gnu` (`cargo clippy --lib --target x86_64-pc-windows-gnu -- -D warnings`). Nothing was run on Windows, and the tests and benches weren't compiled for it, because their dependencies need a Windows C compiler that isn't installed on the machine used. The send cap (now 16KB), the 30s send timeout and the empty-response change are therefore untested, including over a real network path, which is where finding 3 of `audit_mc1.md` applies. The `test-windows` and Windows clippy CI jobs cover the rest on pull requests to `main`.
+- **Not tested:** the rescue thread's limit of 64 accepts per socket per check has no automated test, since the scenario needs a stalled worker and a sustained flood of connections. Moving the sweep's logging outside the lock, and steering on architectures other than x86-64, were not tested either.
 
 ## Documentation
 
-The three Visio diagrams (`Linux TCP request handler sequence diagram.vsdx`, `Linux TCP startup sequence diagram.vsdx` and `Linux request lifecycle and thread states.vsdx`) were updated for the second audit fixes by editing the exported files directly. They weren't opened in Visio afterwards, and any Lucidchart originals they were exported from are unchanged.
+The three Visio diagrams (`Linux TCP request handler sequence diagram.vsdx`, `Linux TCP startup sequence diagram.vsdx` and `Linux request lifecycle and thread states.vsdx`) were updated for the second and third audit fixes by editing the exported files directly. For the third, only the text of existing shapes was changed: no step was added, removed or renumbered, so the lingering close appears as wording on the existing close steps and not as steps of its own. They weren't opened in Visio afterwards, and any Lucidchart originals they were exported from are unchanged.
 
 `README.md` now mentions epoll, the completion port and `AcceptEx`. It also corrects the throughput benchmark's client counts to 1, 4, 8, 12 and 16, which match `benches/throughput.rs`.
 

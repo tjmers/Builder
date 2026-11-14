@@ -43,7 +43,9 @@ const RECV_BYTES: usize = 16 * 1024;
 // How much of a response each send hands to the kernel at most
 // A send only completes once the client has taken all of it, so one send of a whole large response would show no
 // progress until the very end, and a client downloading it slowly would look just like one that had stopped reading
-const SEND_BYTES: usize = 64 * 1024;
+// A piece is the least progress that can be seen, so a client has to take one every SEND_IDLE_TIMEOUT, which at this
+// size is about 550 bytes a second, and anything slower is closed as having stopped reading
+const SEND_BYTES: usize = 16 * 1024;
 
 // How often connections are checked for ones idle past IDLE_TIMEOUT, and the accept pool topped back up if it fell short
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -434,6 +436,10 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
             conn.request = Vec::new();
         } else {
             conn.request.clear();
+        }
+        // Sending nothing would complete with no bytes sent, which is otherwise a failed send
+        if response.is_empty() {
+            return Next::Close;
         }
         conn.response = Some((response, 0));
         // The time spent in the handler is not the client being idle

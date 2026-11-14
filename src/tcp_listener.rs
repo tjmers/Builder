@@ -234,6 +234,52 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2), "framing took {:?}", start.elapsed());
     }
 
+    // A chunked body that stops short of a line ending, sent in small pieces, must not be searched again from the
+    // start of that line on every receive
+    // Each of these took seconds of CPU for one request when it was
+    #[test]
+    fn framer_reads_a_chunked_body_with_an_unfinished_line_once() {
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let filler = MAX_BODY_BYTES - 1024;
+
+        // A chunk size that never ends
+        let mut endless_size = head.to_vec();
+        endless_size.resize(head.len() + filler, b'1');
+        // A long chunk extension, complete, and then the chunk's data in small pieces
+        let mut long_extension = head.to_vec();
+        long_extension.extend_from_slice(format!("{:x};", filler / 2).as_bytes());
+        long_extension.resize(head.len() + filler / 2, b'e');
+        long_extension.extend_from_slice(b"\r\n");
+        long_extension.resize(long_extension.len() + filler / 2, b'a');
+        // A trailer that never ends
+        let mut endless_trailer = head.to_vec();
+        endless_trailer.extend_from_slice(b"0\r\n");
+        endless_trailer.resize(head.len() + filler, b't');
+
+        for (name, request) in [("size", endless_size), ("extension", long_extension), ("trailer", endless_trailer)] {
+            let start = std::time::Instant::now();
+            let (framing, arrived) = frame_in_pieces(&request, 16);
+            assert!(matches!(framing, Framing::Incomplete), "unfinished {name}");
+            assert_eq!(arrived, request.len(), "unfinished {name}");
+            // About 65,000 receives: milliseconds when each byte is read once, and most of a minute when the line is
+            // read again every time
+            assert!(start.elapsed() < Duration::from_secs(2), "framing an unfinished {name} took {:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    fn framer_refuses_anything_but_a_line_ending_after_chunk_data() {
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        // Handed to the parser as soon as the byte after the data shows it is malformed, with no line ending in sight
+        let mut request = head.clone();
+        request.extend_from_slice(b"3\r\nabcx");
+        assert!(matches!(request_len(&request), Framing::Complete(n) if n == request.len()));
+        // A CR alone could still become a CRLF
+        let mut request = head.clone();
+        request.extend_from_slice(b"3\r\nabc\r");
+        assert!(matches!(request_len(&request), Framing::Incomplete));
+    }
+
     #[test]
     fn request_len_frames_by_content_length() {
         let head = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n";

@@ -265,58 +265,82 @@ pub(crate) enum ChunkError {
 
 // RFC 9112 7.1: chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF, ending with a 0 size chunk and trailers
 // Walks a chunked body that may still be arriving, picking up where it left off each time more of it has come in,
-// so a body sent as many small chunks in many small pieces is only ever read once
+// so no byte of a body is read more than once, however small the pieces it arrives in and whether or not they end
+// on a line
 // Framing a request and decoding it both go through here, so they cannot disagree about where a body ends
 #[derive(Default)]
 pub(crate) struct ChunkWalker {
-    // How much of the body is behind it: whole chunks, and once in_trailers whole trailer lines too
+    // How much of the body is behind it: whole chunks, the size line of the chunk it is in, and once in_trailers
+    // whole trailer lines too
     offset: usize,
+    // How many bytes after offset have already been searched for the end of a line that has not all arrived
+    scanned: usize,
+    // The size of the chunk whose data starts at offset, once its size line is behind it
+    chunk: Option<usize>,
     // Whether the 0 size chunk has been passed, leaving only the trailers
     in_trailers: bool,
 }
 
 impl ChunkWalker {
+    // Takes the line starting at offset, without its line ending, once all of it has arrived
+    // Split the same way as next_line_bytes, but a line still arriving is only searched from where the last search ended
+    fn line<'a>(&mut self, body: &'a [u8]) -> Result<&'a [u8], ChunkError> {
+        let rest = &body[self.offset..];
+        let Some(newline) = rest[self.scanned..].iter().position(|&b| b == b'\n') else {
+            self.scanned = rest.len();
+            return Err(ChunkError::Incomplete);
+        };
+        let line = &rest[..self.scanned + newline];
+        self.offset += line.len() + 1;
+        self.scanned = 0;
+        Ok(line.strip_suffix(b"\r").unwrap_or(line))
+    }
+
     // Carries on through body, which must be the same body as last time with any new bytes on the end
     // Passes the data of each chunk it gets past to on_chunk, once, and returns how many bytes the whole body takes
     // up, including the framing, once its end has arrived
     pub(crate) fn advance<'a>(&mut self, body: &'a [u8], mut on_chunk: impl FnMut(&'a [u8])) -> Result<usize, ChunkError> {
-        fn line<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8], ChunkError> {
-            next_line_bytes(rest).map_err(|_| ChunkError::Incomplete)
-        }
-        let mut rest = &body[self.offset..];
-
         while !self.in_trailers {
-            // Chunk extensions after ';' are ignored
-            let size_line = line(&mut rest)?;
-            let size = trim_bytes(size_line.split(|&b| b == b';').next().unwrap_or_default());
-            if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
-                return Err(ChunkError::Malformed);
-            }
-            let size = std::str::from_utf8(size)
-                .ok()
-                .and_then(|size| usize::from_str_radix(size, 16).ok())
-                .ok_or(ChunkError::Malformed)?;
-            if size == 0 {
-                self.in_trailers = true;
-            } else {
-                let data = rest.get(..size).ok_or(ChunkError::Incomplete)?;
-                rest = &rest[size..];
-                if !line(&mut rest)?.is_empty() {
+            let Some(size) = self.chunk else {
+                // Chunk extensions after ';' are ignored
+                let size_line = self.line(body)?;
+                let size = trim_bytes(size_line.split(|&b| b == b';').next().unwrap_or_default());
+                if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
                     return Err(ChunkError::Malformed);
                 }
-                on_chunk(data);
+                let size = std::str::from_utf8(size)
+                    .ok()
+                    .and_then(|size| usize::from_str_radix(size, 16).ok())
+                    .ok_or(ChunkError::Malformed)?;
+                if size == 0 {
+                    self.in_trailers = true;
+                } else {
+                    self.chunk = Some(size);
+                }
+                continue;
+            };
+
+            // The data and the line ending after it, which is looked at directly so that anything else there is
+            // refused straight away instead of being searched for a line ending that may never come
+            let rest = &body[self.offset..];
+            if rest.len() < size {
+                return Err(ChunkError::Incomplete);
             }
-            self.offset = body.len() - rest.len();
+            let (data, after) = rest.split_at(size);
+            let ending = match after {
+                [b'\n', ..] => 1,
+                [b'\r', b'\n', ..] => 2,
+                [] | [b'\r'] => return Err(ChunkError::Incomplete),
+                _ => return Err(ChunkError::Malformed),
+            };
+            on_chunk(data);
+            self.offset += size + ending;
+            self.chunk = None;
         }
 
         // Trailer fields are ignored, up to the terminating empty line
-        loop {
-            let trailer = line(&mut rest)?;
-            self.offset = body.len() - rest.len();
-            if trailer.is_empty() {
-                return Ok(self.offset);
-            }
-        }
+        while !self.line(body)?.is_empty() {}
+        Ok(self.offset)
     }
 }
 

@@ -4,7 +4,7 @@ use std::io;
 use std::mem::{self, MaybeUninit};
 use std::net::Ipv4Addr;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,10 +47,9 @@ const RESCUE_QUIET_CHECKS: u32 = 10;
 // flooding in on one socket cannot keep it from everything else
 const RESCUE_BATCH: usize = 64;
 
-// The rescue thread takes nothing over while this many connections are parked
-// The rest wait in the kernel's queue, where they take up no file descriptor and the kernel refuses new ones once
-// it is full, instead of piling up here until the process runs out of descriptors
-const MAX_PARKED: usize = 512;
+// The most receives one pass makes when discarding what a client sends while the end of its response goes out (see
+// Connection::drain), so a client that keeps sending cannot keep a worker to itself
+const DRAIN_RECVS: usize = 4;
 
 // Logs the last OS error, prefixed by the call that failed
 fn log_os_error(call: &str) {
@@ -70,8 +69,8 @@ fn recv(conn: NativeSocket, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
 // Sends as much of data as the OS accepts, returning the number of bytes sent
 fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
     // MSG_NOSIGNAL so a client that already hung up gives an error instead of a SIGPIPE that kills the server
-    // No MSG_MORE: it would hold the end of the response back until close, and a close with client data still unread
-    // (a pipelined request, say) resets the connection and discards whatever has not been sent
+    // No MSG_MORE: it would hold the end of a response back until close, so even the smallest response would have to
+    // wait for the client to take it before the connection could be closed (see Connection::finish)
     let n = unsafe { libc::send(conn, data.as_ptr() as *const c_void, data.len(), libc::MSG_NOSIGNAL) };
     if n < 0 {
         return Err(io::Error::last_os_error());
@@ -81,6 +80,25 @@ fn send(conn: NativeSocket, data: &[u8]) -> io::Result<usize> {
 
 fn close(conn: NativeSocket) {
     unsafe { libc::close(conn) };
+}
+
+// Asks a connection's socket for one of its byte counts, or None if it could not say
+fn queued_bytes(conn: NativeSocket, request: libc::Ioctl) -> Option<usize> {
+    let mut bytes: c_int = 0;
+    if unsafe { libc::ioctl(conn, request, &mut bytes) } < 0 {
+        return None;
+    }
+    Some(bytes.max(0) as usize)
+}
+
+// How many of the bytes handed to send the client has yet to acknowledge (SIOCOUTQ, which is TIOCOUTQ by another name)
+fn unacked(conn: NativeSocket) -> Option<usize> {
+    queued_bytes(conn, libc::TIOCOUTQ)
+}
+
+// How many of the bytes handed to send have not gone out to the client at all yet
+fn unsent(conn: NativeSocket) -> Option<usize> {
+    queued_bytes(conn, libc::SIOCOUTQNSD as _)
 }
 
 // Sets an int socket option
@@ -230,8 +248,14 @@ struct Connection<'a> {
     framer: Framer,
     // Once the request is handled, the response and how much of it has been sent
     response: Option<(Cow<'a, [u8]>, usize)>,
+    // How much of the response the client had acknowledged at the last sweep
+    acked: usize,
+    // Whether the whole response has been handed to the kernel and the connection is only waiting for the client to
+    // take the end of it (see finish)
+    closing: bool,
     interest: Interest,
-    // When the connection last made progress, for the idle timeout
+    // When the connection last made progress, for the idle timeout: the client sending some of its request or taking
+    // some of its response
     last_active: Instant,
 }
 
@@ -251,6 +275,8 @@ impl<'a> Connection<'a> {
             request,
             framer: Framer::default(),
             response: None,
+            acked: 0,
+            closing: false,
             interest: Interest::None,
             last_active: Instant::now(),
         }
@@ -317,10 +343,70 @@ impl<'a> Connection<'a> {
         Ok(true)
     }
 
+    // Decides what to do once the whole response is in the kernel's send buffer
+    // Closing a connection while the client has sent something that was never read (a pipelined request, a line
+    // ending after a body) resets it, and a reset throws away whatever part of the response has not gone out yet
+    // A response that has all gone out is safe from that, so the connection is closed straight away, which is every
+    // response small enough to go out at once
+    // Otherwise the client is told the response ends here, and the connection stays open, discarding whatever the
+    // client sends, until the client has all of it
+    fn finish(&mut self, fd: NativeSocket) -> Next {
+        // If the kernel cannot say, close as if it had all gone out, which is what closing always did before
+        if unsent(fd).unwrap_or(0) == 0 {
+            return Next::Close;
+        }
+        unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+        self.closing = true;
+        self.drain(fd)
+    }
+
+    // Discards what the client has sent since its request, so that closing cannot reset the connection, and closes
+    // once the client has the whole response or has closed its own end
+    // None of this counts as progress, so a client that keeps sending but takes none of the response is still closed
+    // by the sweep
+    fn drain(&mut self, fd: NativeSocket) -> Next {
+        let mut discarded = [MaybeUninit::<u8>::uninit(); RECV_BYTES];
+        for _ in 0..DRAIN_RECVS {
+            match recv(fd, &mut discarded) {
+                // The client will send nothing more, so there is nothing left that could go unread, and a close
+                // from here on sends the rest of the response as usual
+                Ok(0) => return Next::Close,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // The sweep closes it if the client takes the rest without sending or closing anything
+                    return if unacked(fd).unwrap_or(0) == 0 { Next::Close } else { Next::Wait(Interest::Read) };
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Next::Close,
+            }
+        }
+        // More is waiting, so this is picked up again straight away, after any other connection that is ready
+        Next::Wait(Interest::Read)
+    }
+
     // Whether it has gone too long without progress, allowing longer for a client to take a response than to send a request
     fn is_idle(&self) -> bool {
         let timeout = if self.response.is_some() { SEND_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
         self.last_active.elapsed() >= timeout
+    }
+
+    // Whether the sweep should close it, while it is parked: it is finished, or the client has stopped
+    fn expired(&mut self, fd: NativeSocket) -> bool {
+        if let (Some((_, sent)), Some(unacked)) = (&self.response, unacked(fd)) {
+            // A client taking its response slowly leaves the socket not ready to send for a long time at a stretch,
+            // so its progress is what it has acknowledged, not what the socket has had room for
+            let acked = sent.saturating_sub(unacked);
+            if acked > self.acked {
+                self.acked = acked;
+                self.last_active = Instant::now();
+            }
+            if self.closing && unacked == 0 {
+                return true;
+            }
+        }
+        // One whose socket is ready is not idle: the client has done its part, and it is waiting for a parked
+        // worker to come free, as it would have waited in the kernel's queue for accept
+        self.is_idle() && !is_ready(fd, self.interest)
     }
 }
 
@@ -388,6 +474,9 @@ impl<'a, C> TcpListener<'a, C> {
 
     // Moves a connection along as far as it can go without blocking: receive the request, run the handler, send
     fn drive(&self, fd: NativeSocket, conn: &mut Connection<'a>) -> Next {
+        if conn.closing {
+            return conn.drain(fd);
+        }
         if conn.response.is_none() {
             let total = match conn.recv_request(fd) {
                 Ok(Some(total)) => total,
@@ -413,16 +502,12 @@ impl<'a, C> TcpListener<'a, C> {
         }
 
         match conn.send_response(fd) {
-            Ok(true) => Next::Close,
+            Ok(true) => conn.finish(fd),
             Ok(false) => Next::Wait(Interest::Write),
             Err(()) => Next::Close,
         }
     }
 }
-
-// SO_INCOMING_CPU from the generic socket ABI these architectures use (the libc crate does not export it)
-#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64", target_arch = "arm", target_arch = "riscv64"))]
-const SO_INCOMING_CPU: c_int = 49;
 
 // The CPU each worker runs on: one worker per CPU this process may use, or unpinned workers if that is unknown
 fn worker_cpus() -> Vec<Option<usize>> {
@@ -453,20 +538,16 @@ fn pin_to_cpu(cpu: usize) -> io::Result<()> {
 // client, as the client itself), so waking each other needs no cross-CPU interrupt and the socket stays in that
 // core's cache
 // Connections on a CPU without a steered listener fall back to the usual SO_REUSEPORT hash
-#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64", target_arch = "arm", target_arch = "riscv64"))]
 fn steer_to_cpu(socket: NativeSocket, cpu: usize) -> io::Result<()> {
-    set_option(socket, libc::SOL_SOCKET, SO_INCOMING_CPU, cpu as c_int)
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64", target_arch = "arm", target_arch = "riscv64")))]
-fn steer_to_cpu(_socket: NativeSocket, _cpu: usize) -> io::Result<()> {
-    Ok(())
+    set_option(socket, libc::SOL_SOCKET, libc::SO_INCOMING_CPU, cpu as c_int)
 }
 
 // What the threads share
 // A connection normally goes from accept to close on its CPU's worker without touching any of this
 // Only one that has to wait on its socket is parked here, where any parked worker can pick it up, so a slow handler
 // never holds up a connection other than its own
+// Nothing here is ever cleaned up, since run never returns: the epoll instance, the parked connections and the
+// workers' listening sockets all last as long as the process
 struct Shared<'l, 'a, C> {
     listener: &'l TcpListener<'a, C>,
     // Wakes the parked workers when a parked connection's socket is ready
@@ -474,6 +555,8 @@ struct Shared<'l, 'a, C> {
     // The connections waiting on their sockets
     // One being driven is taken out, so it belongs to one thread at a time and the idle sweep cannot close it
     parked: Mutex<HashMap<NativeSocket, Connection<'a>>>,
+    // How many parked workers are waiting for a connection, which is how many the rescue thread can hand one to
+    free_workers: AtomicUsize,
 }
 
 impl<'a, C> Shared<'_, 'a, C> {
@@ -501,37 +584,26 @@ impl<'a, C> Shared<'_, 'a, C> {
         }
     }
 
-    // Closes parked connections that have gone too long without making progress
+    // Closes parked connections that are finished, or have gone too long without making progress
     // Browsers open spare "preconnect" sockets they may never send a request on, so these are expected
     fn close_idle(&self) {
-        self.parked().retain(|&fd, conn| {
-            if !conn.is_idle() {
-                return true;
-            }
-            // One whose socket is ready is not idle: the client has done its part, and it is waiting for a parked
-            // worker to come free, as it would have waited in the kernel's queue for accept
-            if is_ready(fd, conn.interest) {
-                return true;
-            }
+        // They are taken out of the map with the lock held, and logged and closed once it is released, so a log that
+        // is slow to write (a full pipe, say) does not hold up every thread that parks or takes a connection
+        // Until it is closed here an fd cannot be given to a new connection, and a parked worker that already has
+        // its event finds nothing in the map
+        let expired: Vec<_> = self.parked().extract_if(|&fd, conn| conn.expired(fd)).collect();
+        for (fd, conn) in expired {
             match &conn.response {
-                Some((response, sent)) => {
-                    log_info!("Closing connection that stopped reading after {} of {} bytes", sent, response.len());
+                Some((response, _)) if conn.acked < response.len() => {
+                    log_info!("Closing connection that stopped reading after {} of {} bytes", conn.acked, response.len());
                 }
+                // The client has the whole response
+                Some(_) => {}
                 None => log_info!("Closing connection idle for {:?} after receiving {} bytes", IDLE_TIMEOUT, conn.request.len()),
             }
             // Closing also removes it from epoll
             close(fd);
-            false
-        });
-    }
-}
-
-impl<C> Drop for Shared<'_, '_, C> {
-    fn drop(&mut self) {
-        for &fd in self.parked().keys() {
-            close(fd);
         }
-        unsafe { libc::close(self.epoll) };
     }
 }
 
@@ -589,7 +661,9 @@ impl<'a, C> Worker<'_, '_, 'a, C> {
     fn serve_parked(&mut self) {
         let mut event = epoll_event { events: 0, u64: 0 };
         loop {
+            self.shared.free_workers.fetch_add(1, Ordering::Relaxed);
             let n = unsafe { libc::epoll_wait(self.shared.epoll, &mut event, 1, -1) };
+            self.shared.free_workers.fetch_sub(1, Ordering::Relaxed);
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -638,6 +712,9 @@ struct Watched<'p> {
 // long handler or a CPU busy with something else
 // It hands them to the parked workers and never runs a handler itself, so nothing can hold it up, and those
 // connections wait at most about twice RESCUE_INTERVAL
+// It only takes as many as there are parked workers waiting for one
+// The rest stay in the kernel's queue, where the stalled worker takes them itself if it comes back first, and where
+// they take up no file descriptor and the kernel refuses new ones once it is full
 struct Rescue<'s, 'l, 'a, 'p, C> {
     shared: &'s Shared<'l, 'a, C>,
     watched: Vec<Watched<'p>>,
@@ -694,6 +771,10 @@ impl<'s, 'l, 'a, 'p, C> Rescue<'s, 'l, 'a, 'p, C> {
     fn check_workers(&mut self) -> bool {
         let mut active = self.poll_sockets(Duration::ZERO);
         let waiting = active;
+        // How many connections the parked workers can take right now, shared between every stalled socket
+        // A worker that another connection wakes meanwhile makes this one too many, and that connection then waits
+        // for the next worker to come free
+        let mut free = self.shared.free_workers.load(Ordering::Relaxed);
         for i in 0..self.watched.len() {
             let watched = &mut self.watched[i];
             let progress = watched.progress.0.load(Ordering::Relaxed);
@@ -702,27 +783,29 @@ impl<'s, 'l, 'a, 'p, C> Rescue<'s, 'l, 'a, 'p, C> {
             active |= !stalled;
             if waiting && stalled && self.ready[i].revents & libc::POLLIN != 0 {
                 let socket = watched.socket;
-                self.take_over(socket);
+                free -= self.take_over(socket, free.min(RESCUE_BATCH));
             }
         }
         active
     }
 
-    // Moves the connections queued on socket to the parked workers, up to RESCUE_BATCH of them
+    // Moves the connections queued on socket to the parked workers, up to limit of them, and returns how many
     // The socket is non-blocking only for this, so this cannot get stuck if its worker wakes and takes them first
     // A worker already waiting in accept stays waiting, and one arriving meanwhile just tries again
-    fn take_over(&mut self, socket: NativeSocket) {
-        if self.shared.parked().len() >= MAX_PARKED {
-            return;
+    fn take_over(&mut self, socket: NativeSocket, limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
         }
         if let Err(e) = set_nonblocking(socket, true) {
             log_error!("Failed to make a stalled worker's socket non-blocking: {}", e);
-            return;
+            return 0;
         }
-        for _ in 0..RESCUE_BATCH {
+        let mut taken = 0;
+        while taken < limit {
             match self.shared.listener.accept(socket) {
                 Ok((fd, ip)) => {
                     self.short = false;
+                    taken += 1;
                     self.shared.park(fd, Connection::new(ip, Vec::new()), Interest::Read);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -744,6 +827,7 @@ impl<'s, 'l, 'a, 'p, C> Rescue<'s, 'l, 'a, 'p, C> {
         if let Err(e) = set_nonblocking(socket, false) {
             log_error!("Failed to make a worker's socket blocking again: {}", e);
         }
+        taken
     }
 }
 
@@ -772,7 +856,7 @@ impl<C: Sync> TcpListener<'_, C> {
         }
         log_info!("Now serving on port {}", self.port);
 
-        let shared = Shared { listener: self, epoll, parked: Mutex::new(HashMap::new()) };
+        let shared = Shared { listener: self, epoll, parked: Mutex::new(HashMap::new()), free_workers: AtomicUsize::new(0) };
         let shared = &shared;
 
         // A fixed pool of workers, one per core, since spawning a thread for every connection cost more than serving
@@ -805,7 +889,7 @@ impl<C: Sync> TcpListener<'_, C> {
         // These are not pinned, so one is free to run wherever there is room
         let parked_workers = sockets.len().max(MIN_PARKED_WORKERS);
 
-        // Scoped threads can borrow self (and the context) since they are all joined before run returns
+        // Scoped threads can borrow self (and the context), since run never returns while they are running
         thread::scope(|scope| {
             for (&(listen_socket, cpu), progress) in sockets.iter().zip(&progress) {
                 scope.spawn(move || {

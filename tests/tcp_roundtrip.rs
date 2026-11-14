@@ -571,3 +571,205 @@ fn requests_waiting_for_a_worker_are_not_closed_as_idle() {
     let answered = responses.iter().filter(|response| response.ends_with("\r\n\r\nslow")).count();
     assert_eq!(answered, responses.len(), "only {answered} of {} requests were answered", responses.len());
 }
+
+// The length of a response's body
+fn body_len(response: &[u8]) -> usize {
+    let body_start = response.windows(4).position(|w| w == b"\r\n\r\n").expect("response has no end of headers") + 4;
+    response.len() - body_start
+}
+
+// Starts a server with a large response at /large
+fn start_large_server(port: i32, body_bytes: usize) {
+    thread::spawn(move || {
+        // The size is the server's state, since a handler cannot capture anything
+        let mut s = Server::new(body_bytes);
+        s.add_endpoint(Method::Get, "/large", |_request: &HttpRequest, body_bytes: &usize| -> HttpResponse {
+            HttpResponseBuilder::from_text(Status::Ok, "a".repeat(*body_bytes)).build()
+        });
+        s.run(port);
+    });
+}
+
+// A client that takes its response slowly but never stops is still there, however long the download takes
+// At this rate the server's socket has no room for more for minutes at a time, so the server only sees the client's
+// progress in what it acknowledges
+#[test]
+fn large_response_survives_a_slow_steady_reader() {
+    const BODY_BYTES: usize = 64 * 1024 * 1024;
+    let port = 38126;
+    start_large_server(port, BODY_BYTES);
+
+    let mut stream = connect(port);
+    stream.write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    // 16KB a second for longer than the 30 second send timeout plus its 1 second sweep
+    let mut response = Vec::new();
+    let mut piece = [0; 4 * 1024];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(35) {
+        stream.read_exact(&mut piece).expect("the connection was closed on a client that was still reading");
+        response.extend_from_slice(&piece);
+        thread::sleep(Duration::from_millis(250));
+    }
+    stream.read_to_end(&mut response).expect("the connection was reset before the response ended");
+    assert_eq!(body_len(&response), BODY_BYTES);
+}
+
+// A client that takes none of its response is closed, so it cannot hold on to the response forever
+#[test]
+fn client_that_stops_reading_is_closed() {
+    const BODY_BYTES: usize = 64 * 1024 * 1024;
+    let port = 38127;
+    start_large_server(port, BODY_BYTES);
+
+    let mut stream = connect(port);
+    stream.write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    // Longer than the 30 second send timeout plus its 1 second sweep
+    thread::sleep(Duration::from_secs(33));
+    // Whatever was on its way when the server closed still arrives, and the rest never does
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    assert!(response.len() < BODY_BYTES, "the whole response arrived after the client had stopped reading");
+}
+
+// Closing a connection with client data still unread resets it, and a reset discards what has not gone out yet, so
+// a response too large to go out at once must not be closed until the client has it
+// The extra bytes stand in for anything a client sends past its request: a line ending after it, or a pipelined request
+#[cfg(target_os = "linux")]
+#[test]
+fn large_response_arrives_whole_with_unread_data() {
+    const BODY_BYTES: usize = 8 * 1024 * 1024;
+    let port = 38128;
+    start_large_server(port, BODY_BYTES);
+
+    for extra in [&b"\r\n"[..], &[b'a'; 64 * 1024]] {
+        let mut stream = connect(port);
+        stream.write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        // In a later segment, so it arrives after the request has been read
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(extra).unwrap();
+
+        // Slowly all the way through, so the server has handed over the last of the response while much of it is
+        // still waiting to go out
+        // A reset ends the reading early, as the end of the response does
+        let mut response = Vec::new();
+        let mut piece = [0; 64 * 1024];
+        while let Ok(n @ 1..) = stream.read(&mut piece) {
+            response.extend_from_slice(&piece[..n]);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(body_len(&response), BODY_BYTES, "with {} extra bytes", extra.len());
+    }
+}
+
+// Starts a server pinned to one CPU, which gets the fewest workers the listener ever runs: one pinned to that CPU,
+// and four that serve parked connections
+// Its /slow takes a second to answer
+#[cfg(target_os = "linux")]
+fn start_pinned_server(port: i32) {
+    thread::spawn(move || {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(libc::sched_getcpu() as usize, &mut set);
+            assert_eq!(libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set), 0);
+        }
+        let mut s = Server::new(());
+        s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+            HttpResponseBuilder::from_text(Status::Ok, "index").build()
+        });
+        s.add_endpoint(Method::Get, "/slow", |_request: &HttpRequest, _state: &()| -> HttpResponse {
+            thread::sleep(Duration::from_secs(1));
+            HttpResponseBuilder::from_text(Status::Ok, "slow").build()
+        });
+        s.run(port);
+    });
+}
+
+// Connects to a server on this machine from a chosen local port, or None if that port is taken
+// A connection is otherwise given any free port, which can be one a server in another test is about to listen on,
+// and opening hundreds of them at once makes that likely
+#[cfg(target_os = "linux")]
+fn connect_from(local_port: u16, port: i32) -> Option<TcpStream> {
+    use std::os::fd::FromRawFd;
+
+    let address = |port: u16| {
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        address.sin_port = port.to_be();
+        address
+    };
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    unsafe {
+        let socket = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        assert!(socket >= 0, "socket: {}", std::io::Error::last_os_error());
+        // The stream closes the socket if either call fails
+        let stream = TcpStream::from_raw_fd(socket);
+        let (local, remote) = (address(local_port), address(port as u16));
+        let connected = libc::bind(socket, &local as *const _ as *const libc::sockaddr, len) == 0
+            && libc::connect(socket, &remote as *const _ as *const libc::sockaddr, len) == 0;
+        connected.then_some(stream)
+    }
+}
+
+// Connections that are open but idle take up no thread, so however many there are, a request that arrives behind a
+// slow handler is still handed to another worker
+#[cfg(target_os = "linux")]
+#[test]
+fn idle_connections_do_not_stop_requests_being_taken_from_a_busy_worker() {
+    // Both ends of every connection are in this process, which is more files than a process may usually have open
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = limit.rlim_max.min(8192);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    let port = 38129;
+    start_pinned_server(port);
+
+    drop(connect(port));
+    // Part of a request line gets each connection accepted, and it then waits for the rest
+    let mut idle = Vec::new();
+    let mut local_port = 20000;
+    while idle.len() < 520 {
+        if let Some(mut stream) = connect_from(local_port, port) {
+            stream.write_all(b"GET /in").unwrap();
+            idle.push(stream);
+        }
+        local_port += 1;
+        assert!(local_port < 22000, "only {} connections could be opened", idle.len());
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    let slow = thread::spawn(move || send(port, b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    thread::sleep(Duration::from_millis(100));
+
+    let start = Instant::now();
+    let response = send(port, b"GET /index HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let waited = start.elapsed();
+    assert!(response.ends_with("\r\n\r\nindex"), "response: {response:?}");
+    assert!(waited < Duration::from_millis(500), "the request waited {waited:?} behind the slow handler");
+
+    assert!(slow.join().unwrap().ends_with("\r\n\r\nslow"));
+    drop(idle);
+}
+
+// Requests are only taken from a busy worker's queue when another worker is free to serve them, so the busy worker
+// still gets to the rest when it comes back, instead of finding its queue empty while they wait for someone else
+// With five workers, 14 one second requests take three rounds, and took four when one worker sat out each round
+#[cfg(target_os = "linux")]
+#[test]
+fn every_worker_takes_its_share_of_queued_requests() {
+    let port = 38130;
+    start_pinned_server(port);
+    drop(connect(port));
+
+    let start = Instant::now();
+    let clients: Vec<_> = (0..14)
+        .map(|_| thread::spawn(move || send(port, b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")))
+        .collect();
+    for client in clients {
+        assert!(client.join().unwrap().ends_with("\r\n\r\nslow"));
+    }
+    let took = start.elapsed();
+    assert!(took < Duration::from_millis(3700), "14 requests of a second each took {took:?} on five workers");
+}
