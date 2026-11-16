@@ -121,7 +121,8 @@ jobs:
           key: scaffold
           workspaces: ${{ runner.temp }}/demo
       - name: Generate a project
-        run: ./scripts/builder.sh "$RUNNER_TEMP/demo"
+        # Pin to the commit under test rather than the default release tag
+        run: ./scripts/builder.sh "$RUNNER_TEMP/demo" "${{ github.sha }}"
       - name: Build the generated project
         working-directory: ${{ runner.temp }}/demo
         run: cargo build
@@ -145,7 +146,8 @@ jobs:
           key: scaffold-windows-${{ matrix.shell }}
           workspaces: ${{ runner.temp }}/demo
       - name: Generate a project
-        run: ./scripts/builder.ps1 "$env:RUNNER_TEMP/demo"
+        # Pin to the commit under test rather than the default release tag
+        run: ./scripts/builder.ps1 "$env:RUNNER_TEMP/demo" "${{ github.sha }}"
       - name: Build the generated project
         working-directory: ${{ runner.temp }}/demo
         run: cargo build

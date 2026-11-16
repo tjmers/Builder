@@ -3,9 +3,14 @@
 # PowerShell version of builder.sh; works on Windows PowerShell 5.1 and PowerShell 7+
 
 # The first argument will be the directory name
+# The second is optional: the tag or commit hash of builder to depend on (defaults to the latest release below)
+# Bump the default tag here (and in builder.sh) with each release
 param(
     [Parameter(Position = 0)]
-    [string]$Directory
+    [string]$Directory,
+
+    [Parameter(Position = 1)]
+    [string]$Version = 'v0.1.1'
 )
 
 Set-StrictMode -Version Latest
@@ -13,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 
 # Extra arguments are rejected by PowerShell itself, so only a missing one needs checking
 if (-not $Directory) {
-    [Console]::Error.WriteLine("Usage: $($MyInvocation.MyCommand.Name) <directory>")
+    [Console]::Error.WriteLine("Usage: $($MyInvocation.MyCommand.Name) <directory> [version]")
     exit 1
 }
 
@@ -29,8 +34,16 @@ function Invoke-Native {
 # Writes UTF-8 without a BOM (Windows PowerShell's -Encoding utf8 adds one, which would end up in the SQL)
 $utf8 = New-Object System.Text.UTF8Encoding $false
 
-# The builder checkout this script lives in, which the new project depends on by path
-$builderDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# Where builder is fetched from
+$builderRepo = 'https://github.com/tjmers/Builder'
+
+# A hex string is a commit hash (CI passes the commit under test); anything else is a tag
+if ($Version -match '^[0-9a-fA-F]{7,40}$') {
+    $versionFlag = '--rev'
+}
+else {
+    $versionFlag = '--tag'
+}
 
 # Create any directories necessary
 New-Item -ItemType Directory -Force -Path (Join-Path $Directory 'migrations') | Out-Null
@@ -43,7 +56,7 @@ try {
     Invoke-Native cargo @('init', '--bin')
 
     # Add builder as a dependency to Cargo.toml
-    Invoke-Native cargo @('add', 'builder', '--path', $builderDir, '--features', 'sqlite')
+    Invoke-Native cargo @('add', 'builder', '--git', $builderRepo, $versionFlag, $Version, '--features', 'sqlite')
 
     # The database files are created next to the project when it runs
     [System.IO.File]::AppendAllText((Join-Path $projectDir '.gitignore'), "*.db`n*.db-wal`n*.db-shm`n", $utf8)

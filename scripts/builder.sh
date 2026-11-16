@@ -8,16 +8,26 @@
 # The project serves a hello world page whose text is read from a SQLite database
 
 # $1 will be the directory name
+# $2 is optional: the tag or commit hash of builder to depend on (defaults to the latest release below)
 
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <directory>" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "Usage: $0 <directory> [version]" >&2
   exit 1
 fi
 
-# The builder checkout this script lives in, which the new project depends on by path
-builder_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Where builder is fetched from, and the tag used when no version is given
+# Bump the default tag here (and in builder.ps1) with each release
+builder_repo="https://github.com/tjmers/Builder"
+builder_version="${2:-v0.1.1}"
+
+# A hex string is a commit hash (CI passes the commit under test); anything else is a tag
+if [[ "$builder_version" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+  version_flag="--rev"
+else
+  version_flag="--tag"
+fi
 
 # Create any directories necessary
 mkdir -p "$1/migrations"
@@ -27,7 +37,7 @@ cd "$1"
 cargo init --bin
 
 # Add builder as a dependency to Cargo.toml
-cargo add builder --path "$builder_dir" --features sqlite
+cargo add builder --git "$builder_repo" "$version_flag" "$builder_version" --features sqlite
 
 # The database files are created next to the project when it runs
 printf '*.db\n*.db-wal\n*.db-shm\n' >> .gitignore
