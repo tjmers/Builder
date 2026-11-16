@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Reply, Status};
 use builder::ip_address::IpAddress;
 use builder::server::Server;
 use builder::text::{TextFile, TextType};
@@ -17,7 +17,7 @@ struct AppState {
 #[test]
 fn testcached() {
     // Create the only response beforehand and store it in the app state so that all responses are cached
-    let response = HttpResponseBuilder::from_text_file(Status::Ok, TextFile::new(PAGE, TextType::Html)).build();
+    let response = HttpResponseBuilder::from(Reply::new(Status::Ok, TextFile::new(PAGE, TextType::Html))).build();
     let mut s = Server::new(AppState { response });
 
     s.add_endpoint(Method::Get, "/index", |_request: &HttpRequest, state: &AppState| -> HttpResponse {

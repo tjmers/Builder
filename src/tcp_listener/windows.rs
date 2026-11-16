@@ -612,10 +612,6 @@ impl<'a, C> TcpListener<'a, C> {
         self.port = port;
         true
     }
-
-    pub fn valid(&self) -> bool {
-        self.socket != INVALID_SOCKET
-    }
 }
 
 // C must be Sync because the workers all share the context

@@ -33,19 +33,17 @@ cargo build --release --bins                  # pressure needs the servers built
 | `components parser` | `HttpRequest::new` against `httparse` |
 | `components router_*` | `Server::invoke` against `matchit`, by route count and by path depth |
 
-`wire_post_4kb` overlaps with `cargo bench --bench compare` on the development branch and uses the same workload. It's here so that all of these results come from one harness. That bench runs each server inside the bench process with no pinning, while this crate gives each server its own process and pinned CPUs, so numbers from the two aren't interchangeable.
-
 ## Reading the results
 
 **Connection handling dominates.** Builder closes the connection after every response, so every wire and pressure test opens a new connection per request for every server. Connection setup and teardown take up most of the time, which hides differences in parsing and routing. These results don't predict how Builder would compare in a keep-alive deployment, and the frameworks aren't being run the way they usually are. The keep-alive reference group shows how much that matters to them.
 
-**This measures whatever Builder code is checked out.** The path dependency means the benches measure this checkout's Builder, which is currently blocking with one thread per connection, not the epoll work on `tcp-listener-optimization`. The benches only use Builder's public API, so they're expected to work unchanged after that merges, but that hasn't been tested.
+**This measures whatever Builder code is checked out.** The path dependency means the benches measure this checkout's Builder. The results described below were taken when Builder was blocking with one thread per connection, before its epoll listener, so its thread counts and scaling behavior there no longer describe the current code.
 
 **The workloads aren't identical on the wire.**
 - Builder omits the `Date` and `Server` headers that some others send, so it does slightly less work per response.
 - The std server is a floor, not a framework. It does no real parsing or routing, so it shows how much of the time is the kernel.
 - All servers use a listen backlog of 4096. `std` and `tiny_http` default to 128, so they set it through `std_listener` in `src/lib.rs`.
-- Worker counts are each framework's default, which follows the 8 CPUs they're pinned to, so axum runs 9 threads and actix 10. Builder and std start a new thread per connection. tiny_http also needs a thread per open connection (1009 threads while holding 1000), but it reuses them from a pool.
+- Worker counts are each framework's default, which follows the 8 CPUs they're pinned to, so axum runs 9 threads and actix 10. Builder runs a fixed pool of worker threads. std starts a new thread per connection. tiny_http also needs a thread per open connection (1009 threads while holding 1000), but it reuses them from a pool.
 
 **Comparing the components.**
 - `httparse` only tokenizes, while `HttpRequest::new` also validates and builds its parsed form. httparse is a floor rather than an equal.

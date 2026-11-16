@@ -2,9 +2,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
 
-use crate::image::Image;
-use crate::text::TextFile;
-
 pub use crate::data::http_response_status_codes::Status;
 
 fn reason_phrase(status: Status) -> &'static str {
@@ -103,6 +100,48 @@ pub const VERSIONS_SUPPORTED: [&str; 2] = ["HTTP/1.0", "HTTP/1.1"];
 // RFC 9110 2.5: a server sends the highest version it supports, whatever version the request used
 pub const RESPONSE_VERSION: &str = VERSIONS_SUPPORTED[VERSIONS_SUPPORTED.len() - 1];
 
+// Something that can be sent as the body of a response, such as a TextFile or an Image
+pub trait Content {
+    // What the content is called in the log when it couldn't be loaded
+    const KIND: &'static str;
+
+    fn content_type(&self) -> &'static str;
+
+    fn into_bytes(self) -> Vec<u8>;
+}
+
+// A body and the status to send it with, which HttpResponseBuilder::from turns into a response
+// The body can also be the io::Result of loading it, which becomes a 500 if it couldn't be loaded
+pub struct Reply<T> {
+    pub status: Status,
+    pub body: T,
+}
+
+impl<T> Reply<T> {
+    pub fn new(status: Status, body: T) -> Self {
+        Reply { status, body }
+    }
+}
+
+impl<T: Content> From<Reply<T>> for HttpResponseBuilder {
+    fn from(reply: Reply<T>) -> Self {
+        let content_type = reply.body.content_type();
+        Self::with_content(reply.status, reply.body.into_bytes(), content_type)
+    }
+}
+
+impl<T: Content> From<Reply<io::Result<T>>> for HttpResponseBuilder {
+    fn from(reply: Reply<io::Result<T>>) -> Self {
+        match reply.body {
+            Ok(body) => Reply::new(reply.status, body).into(),
+            Err(e) => {
+                log_error!("500 Internal Server Error: failed to load {}: {}", T::KIND, e);
+                Self::new(Status::InternalServerError)
+            }
+        }
+    }
+}
+
 // Collects the pieces of a response, then builds it into the bytes sent on the wire
 pub struct HttpResponseBuilder {
     status: Status,
@@ -129,38 +168,6 @@ impl HttpResponseBuilder {
 
     pub fn from_text(status: Status, text: impl Into<String>) -> Self {
         Self::with_content(status, text.into().into_bytes(), "text/plain; charset=utf-8")
-    }
-
-    pub fn from_text_file(status: Status, file: TextFile) -> Self {
-        let content_type = file.content_type();
-        Self::with_content(status, file.into_bytes(), content_type)
-    }
-
-    // Sends a 500 if the text file couldn't be loaded
-    pub fn from_text_file_result(status: Status, file: io::Result<TextFile>) -> Self {
-        match file {
-            Ok(file) => Self::from_text_file(status, file),
-            Err(e) => {
-                log_error!("500 Internal Server Error: failed to load text file: {}", e);
-                Self::new(Status::InternalServerError)
-            }
-        }
-    }
-
-    pub fn from_image(status: Status, image: Image) -> Self {
-        let content_type = image.content_type();
-        Self::with_content(status, image.into_bytes(), content_type)
-    }
-
-    // Sends a 500 if the image couldn't be loaded
-    pub fn from_image_result(status: Status, image: io::Result<Image>) -> Self {
-        match image {
-            Ok(image) => Self::from_image(status, image),
-            Err(e) => {
-                log_error!("500 Internal Server Error: failed to load image: {}", e);
-                Self::new(Status::InternalServerError)
-            }
-        }
     }
 
     pub fn status(&self) -> Status {

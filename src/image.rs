@@ -1,5 +1,7 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::http_response::Content;
 
 // The image formats an Image can be served as
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,35 +100,17 @@ impl Image {
     }
 }
 
+impl Content for Image {
+    const KIND: &'static str = "image";
+
+    fn content_type(&self) -> &'static str {
+        self.image_type.mime()
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.data
+    }
+}
+
 // Loading an image from a path reads the file
-impl TryFrom<&Path> for Image {
-    type Error = io::Error;
-
-    fn try_from(path: &Path) -> io::Result<Self> {
-        Image::load(path)
-    }
-}
-
-impl TryFrom<&PathBuf> for Image {
-    type Error = io::Error;
-
-    fn try_from(path: &PathBuf) -> io::Result<Self> {
-        Image::load(path)
-    }
-}
-
-impl TryFrom<PathBuf> for Image {
-    type Error = io::Error;
-
-    fn try_from(path: PathBuf) -> io::Result<Self> {
-        Image::load(&path)
-    }
-}
-
-impl TryFrom<&str> for Image {
-    type Error = io::Error;
-
-    fn try_from(path: &str) -> io::Result<Self> {
-        Image::load(Path::new(path))
-    }
-}
+load_from_paths!(Image);

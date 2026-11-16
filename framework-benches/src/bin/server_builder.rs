@@ -2,7 +2,7 @@
 // The cached routes return Builder's whole response borrowed from the state, its intended fast path
 
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Reply, Status};
 use builder::server::Server;
 use builder::text::{TextFile, TextType};
 use framework_benches::{port_arg, JSON_MESSAGE, PLAINTEXT, POST_BODY_BYTES};
@@ -22,7 +22,7 @@ fn post<'s>(_request: &HttpRequest<'_>, state: &'s State) -> HttpResponse<'s> {
 
 fn json<'s>(_request: &HttpRequest<'_>, _state: &'s State) -> HttpResponse<'s> {
     let body = serde_json::to_vec(&JSON_MESSAGE).expect("serialize");
-    HttpResponseBuilder::from_text_file(Status::Ok, TextFile::new(body, TextType::Json)).build()
+    HttpResponseBuilder::from(Reply::new(Status::Ok, TextFile::new(body, TextType::Json))).build()
 }
 
 fn main() {

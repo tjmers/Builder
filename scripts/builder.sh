@@ -43,7 +43,7 @@ EOF
 cat > src/main.rs <<'EOF'
 use builder::database::{self, Database};
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Reply, Status};
 use builder::logger::LOGGER;
 use builder::server::Server;
 use builder::text::{TextFile, TextType};
@@ -59,7 +59,7 @@ fn index(_request: &HttpRequest, state: &App) -> HttpResponse<'static> {
     match state.db.query_one::<String>("SELECT body FROM messages WHERE id = ?", (1,)) {
         Ok(Some(body)) => {
             let page = format!("<h1>{body}</h1>");
-            HttpResponseBuilder::from_text_file(Status::Ok, TextFile::new(page, TextType::Html)).build()
+            HttpResponseBuilder::from(Reply::new(Status::Ok, TextFile::new(page, TextType::Html))).build()
         }
         Ok(None) => HttpResponseBuilder::new(Status::NotFound).build(),
         Err(e) => {

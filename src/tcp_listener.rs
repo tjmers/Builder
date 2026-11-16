@@ -130,7 +130,7 @@ enum Stage {
 // request arrives in
 // Shared by the Windows and linux listeners so both apply the same limits, and it reads the head with the parser's
 // own scan (scan_head), so the two cannot disagree about where a request ends or whether it is valid
-// The server then splits the head off with head_len, which is the same walk over the lines (walk_head)
+// The server then splits the head off with split_head, which is the same walk over the lines (walk_head)
 #[derive(Default)]
 pub(crate) struct Framer {
     stage: Stage,
@@ -223,8 +223,8 @@ mod tests {
 
     // The server splits the head off the request the listener framed, so both have to end it at the same byte
     #[test]
-    fn head_len_ends_the_head_where_the_framer_does() {
-        use crate::http_request::head_len;
+    fn split_head_ends_the_head_where_the_framer_does() {
+        let head_len = |request| crate::http_request::HttpRequest::split_head(request).map(|(head, _)| head.len());
         let requests: [&[u8]; 5] = [
             b"GET / HTTP/1.1\r\nHost: a\r\n\r\nbody",
             b"GET / HTTP/1.1\nHost: a\n\r\nbody",

@@ -140,15 +140,11 @@ fn next_line_bytes<'a>(request: &mut &'a [u8]) -> Result<&'a [u8], ParseError> {
     Ok(line.strip_suffix(b"\r").unwrap_or(line))
 }
 
-// The length of the head: any empty lines before the request line, the request line, and the headers through the
-// empty line that ends them, split into lines the same way as next_line
-pub(crate) fn head_len(request: &[u8]) -> Result<usize, ParseError> {
-    walk_head(request, |_| {}).ok_or(ParseError::MissingLineEnding)
-}
-
 // Walks the lines of a request's head, passing each header line to on_header, and returns the head's length
+// The head is any empty lines before the request line, the request line, and the headers through the empty line that
+// ends them, split into lines the same way as next_line
 // None if the head has not all arrived
-// The one place the head's lines are counted, so head_len and scan_head cannot disagree about where it ends
+// The one place the head's lines are counted, so split_head and scan_head cannot disagree about where it ends
 fn walk_head(request: &[u8], mut on_header: impl FnMut(&[u8])) -> Option<usize> {
     let mut rest = request;
     // Empty lines before the request line, and then the request line itself
@@ -358,14 +354,12 @@ impl ChunkWalker {
     }
 }
 
-// Walks a chunked body that has arrived in full
-pub(crate) fn walk_chunks<'a>(body: &'a [u8], on_chunk: impl FnMut(&'a [u8])) -> Result<usize, ChunkError> {
-    ChunkWalker::default().advance(body, on_chunk)
-}
-
+// Decodes a chunked body that has arrived in full
 fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, ParseError> {
     let mut decoded = Vec::new();
-    walk_chunks(body, |data| decoded.extend_from_slice(data)).map_err(|_| ParseError::InvalidChunkedBody)?;
+    ChunkWalker::default()
+        .advance(body, |data| decoded.extend_from_slice(data))
+        .map_err(|_| ParseError::InvalidChunkedBody)?;
     Ok(decoded)
 }
 
@@ -428,7 +422,7 @@ impl BodyHeaders {
     }
 }
 
-// Reads just enough of a request's head to frame its body: the length of the head (as head_len) and the kind of
+// Reads just enough of a request's head to frame its body: the length of the head (as split_head) and the kind of
 // body its headers call for, which is an error when the parser is going to reject them
 // None if the head has not all arrived yet
 // Lines are split and headers read the same way as in Head::parse, and anything else the parser objects to is left
@@ -573,7 +567,8 @@ impl<'a> HttpRequest<'a> {
 
     // Splits the bytes received into the head and what follows it
     pub(crate) fn split_head(request: &[u8]) -> Result<(&[u8], &[u8]), ParseError> {
-        Ok(request.split_at(head_len(request)?))
+        let head_len = walk_head(request, |_| {}).ok_or(ParseError::MissingLineEnding)?;
+        Ok(request.split_at(head_len))
     }
 
     // Parses a request from its head and the bytes that followed it, as split by split_head

@@ -23,15 +23,21 @@ impl<S> Default for UriLookupTable<S> {
     }
 }
 
-// Finds the next '/' in s at or after from
-fn next_slash(s: &str, from: usize) -> Option<usize> {
-    s[from..].find('/').map(|i| i + from)
-}
-
-// Determines if any has a valid option
-fn any_valid_methods<T, const N: usize>
-(arr: &[Option<T>; N]) -> bool {
-    arr.iter().any(|opt| opt.is_some())
+// The segments of a path between its slashes, one per level of the lookup table
+// A slash that ends the path stays on the last segment, so "/about/" is a different path from "/about"
+fn segments(path: &str) -> impl Iterator<Item = &str> {
+    let mut rest = path.strip_prefix('/').unwrap_or(path);
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (segment, after) = match rest.find('/') {
+            Some(slash) if slash != rest.len() - 1 => (&rest[..slash], &rest[slash + 1..]),
+            _ => (rest, ""),
+        };
+        rest = after;
+        Some(segment)
+    })
 }
 
 // Comma separated names of the methods with handlers, for the Allow header
@@ -70,23 +76,9 @@ impl<S> Server<S> {
             log_error!("Cannot add an endpoint with an empty uri");
             return false;
         }
-        let mut token_start = usize::from(uri.starts_with('/'));
-        let mut slash = next_slash(uri, token_start);
-
+        // Traverse one step down at a time
         let mut current_state = &mut self.root_lookup;
-
-        while let Some(s) = slash.filter(|&s| s != uri.len() - 1) {
-            // Traverse one step down at a time
-            let token = &uri[token_start..s];
-            current_state = current_state.next.entry(token.to_owned()).or_default();
-
-            token_start = s + 1;
-            slash = next_slash(uri, token_start);
-        }
-
-        if token_start < uri.len() {
-            // Process the final one
-            let token = &uri[token_start..];
+        for token in segments(uri) {
             current_state = current_state.next.entry(token.to_owned()).or_default();
         }
 
@@ -127,50 +119,24 @@ impl<S> Server<S> {
         // Forward the request to the path that will handle it
         // Traverse the path
         let path = request.path();
-        let mut path_state = &self.root_lookup;
-        let mut token_start = usize::from(path.starts_with('/'));
-        let mut slash = next_slash(path, token_start);
+        let found = segments(path).try_fold(&self.root_lookup, |level, token| level.next.get(token));
 
-        while let Some(s) = slash.filter(|&s| s != path.len() - 1) {
-            let token = &path[token_start..s];
-            let Some(next_level) = path_state.next.get(token) else {
-                // Path is not implemented
-                log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponseBuilder::new(Status::NotFound).build();
-            };
-            path_state = next_level;
-
-            token_start = s + 1;
-            slash = next_slash(path, token_start);
-        }
-
-        // Process final
-        if token_start < path.len() {
-            let token = &path[token_start..];
-            let Some(next_level) = path_state.next.get(token) else {
-                // Path is not implemented
-                log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponseBuilder::new(Status::NotFound).build();
-            };
-            path_state = next_level;
-        }
+        // Not found if the path is not implemented, or is an intermediate path with no methods defined
+        let Some(path_state) = found.filter(|level| level.handlers.iter().any(Option::is_some)) else {
+            log_error!("404 Not Found: {:?} {}", method, path);
+            return HttpResponseBuilder::new(Status::NotFound).build();
+        };
 
         // Make sure that the method is actually implemented
         // RFC 9110 9.3.2: HEAD falls back to the GET handler, without the content
         let handler = path_state.handlers[method as usize]
             .or_else(|| path_state.handlers[Method::Get as usize].filter(|_| method == Method::Head));
         let Some(handler) = handler else {
-            if any_valid_methods(&path_state.handlers) {
-                log_error!("405 Method Not Allowed: {:?} {}", method, path);
-                // RFC 9110 15.5.6: a 405 must list the methods that are allowed
-                let mut response = HttpResponseBuilder::new(Status::MethodNotAllowed);
-                response.headers_mut().insert("Allow".to_owned(), allowed_methods(&path_state.handlers));
-                return response.build();
-            } else {
-                // We return not found if we are at an intermediate path with no methods defined
-                log_error!("404 Not Found: {:?} {}", method, path);
-                return HttpResponseBuilder::new(Status::NotFound).build();
-            }
+            log_error!("405 Method Not Allowed: {:?} {}", method, path);
+            // RFC 9110 15.5.6: a 405 must list the methods that are allowed
+            let mut response = HttpResponseBuilder::new(Status::MethodNotAllowed);
+            response.headers_mut().insert("Allow".to_owned(), allowed_methods(&path_state.handlers));
+            return response.build();
         };
 
         // Dispatch

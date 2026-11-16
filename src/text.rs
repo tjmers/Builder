@@ -1,5 +1,7 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::http_response::Content;
 
 // The text formats a TextFile can be served as
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,35 +100,17 @@ impl TextFile {
     }
 }
 
+impl Content for TextFile {
+    const KIND: &'static str = "text file";
+
+    fn content_type(&self) -> &'static str {
+        self.text_type.mime()
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.data
+    }
+}
+
 // Loading a text file from a path reads the file
-impl TryFrom<&Path> for TextFile {
-    type Error = io::Error;
-
-    fn try_from(path: &Path) -> io::Result<Self> {
-        TextFile::load(path)
-    }
-}
-
-impl TryFrom<&PathBuf> for TextFile {
-    type Error = io::Error;
-
-    fn try_from(path: &PathBuf) -> io::Result<Self> {
-        TextFile::load(path)
-    }
-}
-
-impl TryFrom<PathBuf> for TextFile {
-    type Error = io::Error;
-
-    fn try_from(path: PathBuf) -> io::Result<Self> {
-        TextFile::load(&path)
-    }
-}
-
-impl TryFrom<&str> for TextFile {
-    type Error = io::Error;
-
-    fn try_from(path: &str) -> io::Result<Self> {
-        TextFile::load(Path::new(path))
-    }
-}
+load_from_paths!(TextFile);

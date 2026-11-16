@@ -495,10 +495,6 @@ impl<'a, C> TcpListener<'a, C> {
         }
     }
 
-    pub fn valid(&self) -> bool {
-        self.socket >= 0
-    }
-
     // Accepts one connection from a listening socket, waiting for one if the socket is blocking
     fn accept(&self, listen_socket: NativeSocket) -> io::Result<(NativeSocket, IpAddress)> {
         let mut client: sockaddr_in = unsafe { mem::zeroed() };

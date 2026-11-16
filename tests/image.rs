@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use builder::http_request::{HttpRequest, Method};
-use builder::http_response::{HttpResponse, HttpResponseBuilder, Status};
+use builder::http_response::{HttpResponse, HttpResponseBuilder, Reply, Status};
 use builder::image::{Image, ImageType};
 use builder::ip_address::IpAddress;
 use builder::server::Server;
@@ -76,7 +76,7 @@ fn image_served_by_endpoint() {
     let mut s = Server::new(());
     s.add_endpoint(Method::Get, "/logo", |_request: &HttpRequest, _state: &()| -> HttpResponse {
         let image = Image::new(PNG_BYTES, ImageType::Png);
-        HttpResponseBuilder::from_image(Status::Ok, image).build()
+        HttpResponseBuilder::from(Reply::new(Status::Ok, image)).build()
     });
 
     let request = HttpRequest::new("GET /logo HTTP/1.1\r\nHost: www.example.com\r\n\r\n").unwrap();
@@ -91,7 +91,7 @@ fn image_served_by_endpoint() {
 #[test]
 fn image_result_error_is_500() {
     let image = Image::try_from("definitely_missing_builder_image.png");
-    let response = HttpResponseBuilder::from_image_result(Status::Ok, image).build();
+    let response = HttpResponseBuilder::from(Reply::new(Status::Ok, image)).build();
 
     assert_eq!(response.status_code(), 500);
     assert!(response.body().is_empty());
