@@ -125,3 +125,27 @@ jobs:
       - name: Build the generated project
         working-directory: ${{ runner.temp }}/demo
         run: cargo build
+
+  # Same check for scripts/builder.ps1, under both Windows PowerShell 5.1 and PowerShell 7
+  scaffold-windows:
+    name: scaffold script (windows, ${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: scaffold-windows-${{ matrix.shell }}
+          workspaces: ${{ runner.temp }}/demo
+      - name: Generate a project
+        run: ./scripts/builder.ps1 "$env:RUNNER_TEMP/demo"
+      - name: Build the generated project
+        working-directory: ${{ runner.temp }}/demo
+        run: cargo build
