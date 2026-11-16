@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Specification tests for Server::invoke, based on RFC 9110 (HTTP semantics) and RFC 9112 (HTTP/1.1)
 // Many of these are expected to fail until invoke and HttpRequest::new implement the full behavior
 

@@ -82,3 +82,9 @@ Comparisons with axum, actix-web, tiny_http, and a bare `std::net` server are in
 ## TODO
 
 - Force crlf internally
+
+## License
+
+Builder is licensed under the [Mozilla Public License 2.0](LICENSE). You can use it in projects under any license, including proprietary ones. If you distribute modified versions of Builder's own source files, those files must stay under the MPL-2.0.
+
+The project scaffolding (`scripts/build.rs`, `scripts/views_mod.rs`, and the files `scripts/builder.sh` generates in a new project) is free to use for any purpose, without restriction. Projects created with Builder don't have to use the MPL-2.0.
